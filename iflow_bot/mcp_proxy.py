@@ -29,6 +29,7 @@ class MCPServer:
         cmd = self.config["command"]
         args = self.config.get("args", [])
         env = self.config.get("env", {})
+        cwd = self.config.get("cwd", None)
         full_env = os.environ.copy()
         full_env.update(env)
 
@@ -39,6 +40,7 @@ class MCPServer:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=full_env,
+            cwd=cwd,
         )
         self.running = True
         print(f"[{self.name}] MCP server started (PID: {self.process.pid})")
@@ -83,6 +85,7 @@ class MCPProxy:
         self.app = web.Application()
         self.app.router.add_post("/{server_name}", self.handle_request)
         self.app.router.add_get("/health", self.handle_health)
+        self.app.router.add_get("/tools", self.handle_tools)
 
     @staticmethod
     def _load_config(config_path: str) -> dict[str, Any]:
@@ -118,6 +121,37 @@ class MCPProxy:
 
     async def handle_health(self, request: web.Request) -> web.Response:
         return web.json_response({"status": "healthy", "servers": list(self.servers.keys())})
+
+    async def handle_tools(self, request: web.Request) -> web.Response:
+        """返回所有 MCP 服务器的工具列表"""
+        import asyncio
+        tools_info = {}
+        
+        async def fetch_tools(name, server):
+            try:
+                # 调用 MCP 的 tools/list 方法，超时 3 秒
+                response = await asyncio.wait_for(
+                    server.send_request({"method": "tools/list", "params": {}}),
+                    timeout=3.0
+                )
+                return name, response.get("result", {}).get("tools", [])
+            except asyncio.TimeoutError:
+                return name, {"error": "timeout"}
+            except Exception as e:
+                return name, {"error": str(e)}
+        
+        # 并行获取所有服务器的工具列表
+        tasks = [fetch_tools(name, server) for name, server in self.servers.items()]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for result in results:
+            if isinstance(result, Exception):
+                tools_info[str(result)] = {"error": "failed"}
+            else:
+                name, tools = result
+                tools_info[name] = tools
+        
+        return web.json_response({"servers": list(self.servers.keys()), "tools": tools_info})
 
     async def start_http_server(self, port: int) -> web.AppRunner:
         runner = web.AppRunner(self.app)
