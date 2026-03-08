@@ -578,29 +578,34 @@ class StdioACPClient:
         
         try:
             timeout = timeout or self.timeout
-            start_time = asyncio.get_running_loop().time()
-            
+            # 使用空闲超时：每次收到消息后重置计时器
+            # 这样长时间生成内容不会触发超时，只有真正卡住才会超时
+            last_activity_time = asyncio.get_running_loop().time()
+
             while True:
-                remaining = timeout - (asyncio.get_running_loop().time() - start_time)
-                if remaining <= 0:
-                    raise StdioACPTimeoutError("Prompt timeout")
-                
+                idle_time = asyncio.get_running_loop().time() - last_activity_time
+                if idle_time >= timeout:
+                    raise StdioACPTimeoutError("Prompt timeout (idle)")
+
                 try:
                     if future.done():
                         break
-                    
+
                     # 优先检查自己的私有队列，找不到再看全局队列（Legacy 兼容）
                     try:
                         msg = await asyncio.wait_for(
                             session_queue.get(),
                             timeout=0.1
                         )
+                        last_activity_time = asyncio.get_running_loop().time()  # 收到消息，重置计时器
                     except asyncio.TimeoutError:
                         # 尝试从全局队列获取（如果没有 sessionId 字段）
+                        remaining_idle = timeout - idle_time
                         msg = await asyncio.wait_for(
                             self._message_queue.get(),
-                            timeout=min(remaining, 4.9)
+                            timeout=min(remaining_idle, 4.9)
                         )
+                        last_activity_time = asyncio.get_running_loop().time()  # 收到消息，重置计时器
                     
                     if msg.get("method") == "session/update":
                         params = msg.get("params", {})

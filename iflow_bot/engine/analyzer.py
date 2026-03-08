@@ -174,8 +174,18 @@ class ResultAnalyzer:
                 continue
             seen.add(file_path)
 
+            # Skip URLs and network paths - only check local files
+            lower_path = file_path.lower()
+            if lower_path.startswith(("http://", "https://", "//")):
+                continue
+
             # Only include files that actually exist on disk
-            if not Path(file_path).is_file():
+            try:
+                if not Path(file_path).is_file():
+                    continue
+            except OSError as e:
+                # Skip paths that cause errors (e.g., network paths on Windows)
+                logger.debug(f"Skip inaccessible path: {file_path} ({e})")
                 continue
 
             ext = Path(file_path).suffix.lower()
