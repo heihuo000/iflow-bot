@@ -1,14 +1,28 @@
-"""QQ channel implementation using qq-botpy SDK.
+"""QQ channel implementation using @sliverp/qqbot compatible API.
 
-使用 qq-botpy SDK 通过 WebSocket 连接 QQ 频道机器人。
-支持 C2C 私聊消息和 QQ 群消息。
+使用与 @sliverp/qqbot 相同的 QQ 官方 API 和 WebSocket 网关。
+支持 C2C 私聊消息和群消息。
+
+参考：https://github.com/sliverp/qqbot
 """
 
+from __future__ import annotations
+
 import asyncio
+import hashlib
+import hmac
+import json
 import logging
+import time
+import base64
+import zlib
 from collections import deque
-from pathlib import Path
-from typing import Any, Optional, TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import Any, Optional, Callable, Coroutine
+
+import aiohttp
+import websockets
+from websockets.asyncio.client import connect as ws_connect
 
 from iflow_bot.bus.events import OutboundMessage
 from iflow_bot.bus.queue import MessageBus
@@ -16,396 +30,606 @@ from iflow_bot.channels.base import BaseChannel
 from iflow_bot.channels.manager import register_channel
 from iflow_bot.config.schema import QQConfig
 
-try:
-    import botpy
-    from botpy.message import C2CMessage, GroupMessage
-    QQ_AVAILABLE = True
-except ImportError:
-    QQ_AVAILABLE = False
-    botpy = None  # type: ignore
-    C2CMessage = None  # type: ignore
-    GroupMessage = None  # type: ignore
-
-if TYPE_CHECKING:
-    from botpy.message import C2CMessage, GroupMessage
-
-
 logger = logging.getLogger(__name__)
 
+# QQ Bot API 常量
+API_BASE = "https://api.sgroup.qq.com"
+TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
+GATEWAY_URL = "wss://gateway.sgroup.qq.com/"
 
-def _make_bot_class(channel: "QQChannel") -> Any:
-    """创建绑定到指定 Channel 的 botpy.Client 子类。"""
-    intents = botpy.Intents(public_messages=True, direct_message=True)
+# Intent 配置
+INTENTS = {
+    "GUILDS": 1 << 0,
+    "GUILD_MEMBERS": 1 << 1,
+    "PUBLIC_GUILD_MESSAGES": 1 << 30,
+    "DIRECT_MESSAGE": 1 << 12,
+    "GROUP_AND_C2C": 1 << 25,
+}
 
-    class _Bot(botpy.Client):
-        def __init__(self):
-            super().__init__(intents=intents)
+# 权限级别：从高到低依次尝试
+INTENT_LEVELS = [
+    {"name": "full", "intents": INTENTS["PUBLIC_GUILD_MESSAGES"] | INTENTS["DIRECT_MESSAGE"] | INTENTS["GROUP_AND_C2C"]},
+    {"name": "group+channel", "intents": INTENTS["PUBLIC_GUILD_MESSAGES"] | INTENTS["GROUP_AND_C2C"]},
+    {"name": "channel-only", "intents": INTENTS["PUBLIC_GUILD_MESSAGES"] | INTENTS["GUILD_MEMBERS"]},
+]
 
-        async def on_ready(self):
-            logger.info(f"[{channel.name}] QQ bot ready: {self.robot.name}")
 
-        async def on_c2c_message_create(self, message: "C2CMessage"):
-            await channel._on_c2c_message(message)
+@dataclass
+class AccessToken:
+    """访问令牌。"""
+    token: str = ""
+    expires_at: float = 0
+    expires_in: int = 7200
 
-        async def on_group_at_message_create(self, message: "GroupMessage"):
-            await channel._on_group_message(message)
 
-    return _Bot
+@dataclass
+class SessionState:
+    """WebSocket 会话状态。"""
+    session_id: str = ""
+    last_seq: int = 0
+    resume_url: str = ""
+
+
+class QQBotAPI:
+    """QQ Bot API 客户端。"""
+
+    def __init__(self, app_id: str, client_secret: str):
+        self.app_id = app_id
+        self.client_secret = client_secret
+        self._token: Optional[AccessToken] = None
+        self._token_lock = asyncio.Lock()
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
+
+    async def get_access_token(self) -> str:
+        """获取访问令牌（带缓存）。"""
+        async with self._token_lock:
+            if self._token and time.time() < self._token.expires_at - 300:
+                return self._token.token
+
+        session = await self._get_session()
+
+        logger.info(f"[qqbot] Fetching access token for app_id={self.app_id}")
+
+        try:
+            async with session.post(
+                TOKEN_URL,
+                json={"appId": self.app_id, "clientSecret": self.client_secret},
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                data = await resp.json()
+
+                if not data.get("access_token"):
+                    raise Exception(f"Failed to get access_token: {data}")
+
+                expires_in = int(data.get("expires_in", 7200))
+                self._token = AccessToken(
+                    token=data["access_token"],
+                    expires_at=time.time() + expires_in * 0.9,  # 提前 10% 刷新
+                    expires_in=expires_in,
+                )
+
+                logger.info(f"[qqbot] Token acquired, expires in {expires_in}s")
+                return self._token.token
+
+        except Exception as e:
+            logger.error(f"[qqbot] Failed to get token: {e}")
+            raise
+
+    async def api_request(
+        self,
+        method: str,
+        path: str,
+        body: Optional[dict] = None,
+        timeout: int = 30,
+    ) -> dict:
+        """发送 API 请求。"""
+        token = await self.get_access_token()
+        session = await self._get_session()
+
+        url = f"{API_BASE}{path}"
+        headers = {
+            "Authorization": f"QQBot {token}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            async with session.request(
+                method,
+                url,
+                json=body,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as resp:
+                if resp.status >= 400:
+                    error_data = await resp.text()
+                    logger.error(f"[qqbot] API error {resp.status}: {error_data}")
+                    raise Exception(f"API error: {resp.status} - {error_data}")
+
+                return await resp.json()
+
+        except aiohttp.ClientError as e:
+            logger.error(f"[qqbot] Network error: {e}")
+            raise
+
+    async def send_c2c_message(
+        self,
+        openid: str,
+        content: str,
+        msg_id: Optional[str] = None,
+        msg_seq: int = 1,
+    ) -> dict:
+        """发送 C2C 消息。
+
+        注意：如果有 msg_id（回复消息），使用被动回复模式（/messages 接口）
+        如果没有 msg_id（主动消息），需要使用 /messages 接口但可能受限于每日配额
+        """
+        body: dict = {
+            "content": content,
+            "msg_type": 0,  # 文本
+            "msg_seq": msg_seq,
+        }
+
+        if msg_id:
+            body["msg_id"] = msg_id
+            body["event_type"] = "C2C_MESSAGE_CREATE"
+
+        # 使用 /v2/users/{openid}/messages 接口（@sliverp/qqbot 方式）
+        return await self.api_request("POST", f"/v2/users/{openid}/messages", body, timeout=30)
+
+    async def send_group_message(
+        self,
+        group_openid: str,
+        content: str,
+        msg_id: Optional[str] = None,
+        msg_seq: int = 1,
+    ) -> dict:
+        """发送群消息。"""
+        body: dict = {
+            "content": content,
+            "msg_type": 0,
+            "msg_seq": msg_seq,
+        }
+
+        if msg_id:
+            body["msg_id"] = msg_id
+            body["event_type"] = "C2C_MESSAGE_CREATE"
+
+        return await self.api_request("POST", f"/v2/groups/{group_openid}/messages", body, timeout=30)
+
+    async def send_c2c_input_notify(
+        self,
+        openid: str,
+        msg_id: str,
+    ) -> None:
+        """发送 C2C 输入状态通知。"""
+        try:
+            body = {
+                "msg_id": msg_id,
+                "action_type": 1,  # 正在输入
+                "event_type": "C2C_INPUT_TYPING",
+            }
+            await self.api_request("POST", f"/v2/c2c/{openid}/typing", body, timeout=10)
+        except Exception as e:
+            logger.debug(f"[qqbot] Failed to send typing notify: {e}")
+
+    async def get_gateway_url(self) -> str:
+        """获取 WebSocket 网关 URL。"""
+        result = await self.api_request("GET", "/gateway", timeout=30)
+        return result.get("url", GATEWAY_URL)
+
+    async def get_gateway_bot_url(self) -> str:
+        """获取带分片信息的网关 URL。"""
+        result = await self.api_request("GET", "/gateway/bot", timeout=30)
+        return result.get("url", GATEWAY_URL), result.get("shards", 1), result.get("session_start_limit", {})
+
+
+# 消息序号追踪器
+_msg_seq_tracker: dict[str, int] = {}
+
+
+def get_next_msg_seq(msg_id: str) -> int:
+    """获取下一条消息的序号。"""
+    current = _msg_seq_tracker.get(msg_id, 0)
+    next_seq = current + 1
+    _msg_seq_tracker[msg_id] = next_seq
+
+    # 清理过期记录
+    if len(_msg_seq_tracker) > 1000:
+        keys = list(_msg_seq_tracker.keys())
+        for i in range(500):
+            _msg_seq_tracker.pop(keys[i], None)
+
+    return next_seq
 
 
 @register_channel("qq")
 class QQChannel(BaseChannel):
-    """QQ Channel - 使用 qq-botpy SDK 通过 WebSocket 连接。
+    """QQ Channel - 使用 QQ 官方 API 和 WebSocket 网关。
+
+    与 @sliverp/qqbot 使用相同的 API 实现。
 
     支持:
     - C2C 私聊消息
-    - QQ 群 @机器人消息
+    - 群消息
+    - 频道消息
 
     要求:
     - app_id: QQ 机器人 AppID
     - secret: QQ 机器人 Secret
-
-    Attributes:
-        name: 渠道名称 ("qq")
-        config: QQ 配置对象
-        bus: 消息总线实例
-        _client: botpy Client 实例
-        _processed_ids: 已处理消息 ID 队列 (去重)
-        _group_msg_seq: 群消息序号计数器
     """
 
     name = "qq"
 
     def __init__(self, config: QQConfig, bus: MessageBus):
-        """初始化 QQ Channel。
-
-        Args:
-            config: QQ 配置对象
-            bus: 消息总线实例
-        """
         super().__init__(config, bus)
         self.config: QQConfig = config
-        self._client: Any = None
+        self._api: Optional[QQBotAPI] = None
+        self._ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._running = False
         self._processed_ids: deque = deque(maxlen=1000)
-        self._group_msg_seq: dict[str, int] = {}  # 群消息序号计数器
+        self._session_state: Optional[SessionState] = None
+        self._heartbeat_interval: float = 0
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._reconnect_attempts = 0
+        self._intent_level_index = 0
+        self._last_connect_time: float = 0
+        self._msg_seq_map: dict[str, int] = {}
 
     async def start(self) -> None:
-        """启动 QQ Bot。"""
-        if not QQ_AVAILABLE:
-            logger.error(
-                f"[{self.name}] QQ SDK not installed. Run: pip install qq-botpy"
-            )
-            return
-
+        """启动 QQ Bot 网关连接。"""
         if not self.config.app_id or not self.config.secret:
             logger.error(f"[{self.name}] app_id and secret not configured")
             return
 
-        # 加载持久化的 msg_seq 状态
-        await self._load_msg_seq_state()
-
+        self._api = QQBotAPI(self.config.app_id, self.config.secret)
         self._running = True
-        BotClass = _make_bot_class(self)
-        self._client = BotClass()
 
-        logger.info(f"[{self.name}] QQ bot started (C2C + Group)")
-        await self._run_bot()
+        logger.info(f"[{self.name}] Starting QQ Bot gateway connection")
 
-    async def _run_bot(self) -> None:
-        """运行 Bot 连接，支持自动重连。"""
         while self._running:
             try:
-                await self._client.start(
-                    appid=self.config.app_id,
-                    secret=self.config.secret
-                )
+                await self._connect_gateway()
             except Exception as e:
-                logger.warning(f"[{self.name}] QQ bot error: {e}")
-            finally:
-                # 连接断开时保存 msg_seq 状态
-                await self._save_msg_seq_state()
+                logger.error(f"[{self.name}] Gateway error: {e}")
+
             if self._running:
-                logger.info(f"[{self.name}] Reconnecting in 5 seconds...")
                 await asyncio.sleep(5)
+
+    async def _connect_gateway(self) -> None:
+        """连接 WebSocket 网关。"""
+        if not self._api:
+            return
+
+        # 获取网关 URL
+        try:
+            gateway_url, shards, session_limit = await self._api.get_gateway_bot_url()
+            logger.info(f"[{self.name}] Gateway URL: {gateway_url}, shards: {shards}")
+        except Exception as e:
+            logger.error(f"[{self.name}] Failed to get gateway URL: {e}")
+            gateway_url = GATEWAY_URL
+
+        # 计算 intents
+        intents = INTENT_LEVELS[min(self._intent_level_index, len(INTENT_LEVELS) - 1)]["intents"]
+        intent_name = INTENT_LEVELS[min(self._intent_level_index, len(INTENT_LEVELS) - 1)]["name"]
+        logger.info(f"[{self.name}] Using intent level: {intent_name}")
+
+        # WebSocket URL
+        ws_url = f"{gateway_url}?v=2&intent={intents}"
+
+        # 如果有保存的 session，尝试 resume
+        if self._session_state and self._session_state.session_id:
+            ws_url += f"&resume=true"
+
+        try:
+            async with ws_connect(ws_url, close_timeout=10, max_size=10 * 1024 * 1024) as ws:
+                self._ws = ws
+                logger.info(f"[{self.name}] WebSocket connected")
+
+                # 监听消息
+                await self._ws_message_loop()
+
+        except websockets.ConnectionClosed as e:
+            logger.warning(f"[{self.name}] WebSocket closed: {e.code} {e.reason}")
+            self._ws = None
+            raise
+        except Exception as e:
+            logger.error(f"[{self.name}] WebSocket error: {e}")
+            self._ws = None
+            raise
+
+    async def _ws_message_loop(self) -> None:
+        """WebSocket 消息接收循环。"""
+        if not self._ws:
+            return
+
+        buffer = bytearray()
+
+        async for message in self._ws:
+            if not self._running:
+                break
+
+            # 处理 zlib 压缩
+            if isinstance(message, bytes):
+                if message[-4:] == b'\x00\x00\xff\xff':
+                    buffer.extend(message[:-4])
+                    continue
+                else:
+                    buffer.extend(message)
+                    try:
+                        decompressed = zlib.decompress(buffer, -15)
+                        payload = json.loads(decompressed.decode('utf-8'))
+                        buffer.clear()
+                    except Exception:
+                        logger.error(f"[{self.name}] Failed to decompress message")
+                        buffer.clear()
+                        continue
+            else:
+                try:
+                    payload = json.loads(message)
+                except json.JSONDecodeError:
+                    logger.error(f"[{self.name}] Invalid JSON payload")
+                    continue
+
+            # 处理 payload
+            await self._handle_payload(payload)
+
+    async def _handle_payload(self, payload: dict) -> None:
+        """处理 WebSocket payload。"""
+        op = payload.get("op", 0)
+        data = payload.get("d", {})
+        t = payload.get("t")
+        s = payload.get("s", 0)
+
+        # 更新 seq
+        if s > 0:
+            if self._session_state:
+                self._session_state.last_seq = s
+            else:
+                self._session_state = SessionState(last_seq=s)
+
+        if op == 0:  # Dispatch
+            await self._handle_dispatch(t, data)
+        elif op == 7:  # Reconnect
+            logger.warning(f"[{self.name}] Received reconnect request")
+            await self._reconnect()
+        elif op == 9:  # Invalid Session
+            logger.error(f"[{self.name}] Invalid session")
+            await self._identify()
+        elif op == 10:  # Hello
+            self._heartbeat_interval = data.get("heartbeat_interval", 45000) / 1000
+            logger.info(f"[{self.name}] Hello, heartbeat interval: {self._heartbeat_interval}s")
+            await self._identify()
+            await self._start_heartbeat()
+        elif op == 11:  # Heartbeat ACK
+            logger.debug(f"[{self.name}] Heartbeat ACK received")
+
+    async def _handle_dispatch(self, event_type: str, data: dict) -> None:
+        """处理 Dispatch 事件。"""
+        if event_type == "READY":
+            self._reconnect_attempts = 0
+            session_id = data.get("session_id", "")
+            user = data.get("user", {})
+
+            if self._session_state:
+                self._session_state.session_id = session_id
+            else:
+                self._session_state = SessionState(session_id=session_id)
+
+            logger.info(f"[{self.name}] Ready! Session: {session_id[:16]}..., User: {user.get('username', 'unknown')}")
+
+        elif event_type == "RESUMED":
+            logger.info(f"[{self.name}] Session resumed successfully")
+
+        elif event_type == "C2C_MESSAGE_CREATE":
+            await self._handle_c2c_message(data)
+
+        elif event_type == "GROUP_AT_MESSAGE_CREATE":
+            await self._handle_group_message(data)
+
+    async def _handle_c2c_message(self, data: dict) -> None:
+        """处理 C2C 消息。"""
+        msg_id = data.get("id", "")
+        openid = data.get("author", {}).get("user_openid", "")
+        content = data.get("content", "").strip()
+        timestamp = data.get("timestamp", "")
+
+        if not content or not openid:
+            return
+
+        # 去重
+        if msg_id in self._processed_ids:
+            return
+        self._processed_ids.append(msg_id)
+
+        # 发送输入通知
+        try:
+            await self._api.send_c2c_input_notify(openid, msg_id)
+        except Exception as e:
+            logger.debug(f"[{self.name}] Failed to send input notify: {e}")
+
+        # 转发到消息总线
+        await self._handle_message(
+            sender_id=openid,
+            chat_id=openid,
+            content=content,
+            metadata={"message_id": msg_id, "timestamp": timestamp},
+        )
+
+    async def _handle_group_message(self, data: dict) -> None:
+        """处理群消息。"""
+        msg_id = data.get("id", "")
+        group_openid = data.get("group_openid", "")
+        content = data.get("content", "").strip()
+        timestamp = data.get("timestamp", "")
+
+        if not content or not group_openid:
+            return
+
+        # 去重
+        if msg_id in self._processed_ids:
+            return
+        self._processed_ids.append(msg_id)
+
+        # 转发到消息总线
+        await self._handle_message(
+            sender_id=group_openid,
+            chat_id=f"group:{group_openid}",
+            content=content,
+            metadata={"message_id": msg_id, "timestamp": timestamp},
+        )
+
+    async def _identify(self) -> None:
+        """发送 Identify 或 Resume。"""
+        if not self._ws or not self._api:
+            return
+
+        token = await self._api.get_access_token()
+
+        identify_payload = {
+            "op": 2,  # Identify
+            "d": {
+                "token": f"QQBot {token}",
+                "intents": INTENT_LEVELS[min(self._intent_level_index, len(INTENT_LEVELS) - 1)]["intents"],
+                "shard": [0, 1],  # 单分片
+                "properties": {
+                    "os": "linux",
+                    "browser": "iflow-bot",
+                    "device": "iflow-bot",
+                },
+            },
+        }
+
+        # 如果有 session，尝试 resume
+        if self._session_state and self._session_state.session_id:
+            identify_payload["d"]["resume"] = True
+            identify_payload["d"]["session_id"] = self._session_state.session_id
+            identify_payload["d"]["seq"] = self._session_state.last_seq
+
+        await self._ws.send(json.dumps(identify_payload))
+        logger.info(f"[{self.name}] Identify sent")
+
+    async def _start_heartbeat(self) -> None:
+        """启动心跳循环。"""
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+
+        async def heartbeat_loop():
+            while self._running and self._ws:
+                try:
+                    seq = self._session_state.last_seq if self._session_state else 0
+                    await self._ws.send(json.dumps({"op": 1, "d": seq}))
+                    logger.debug(f"[{self.name}] Heartbeat sent, seq={seq}")
+                except Exception as e:
+                    logger.error(f"[{self.name}] Failed to send heartbeat: {e}")
+                    break
+
+                await asyncio.sleep(self._heartbeat_interval)
+
+        self._heartbeat_task = asyncio.create_task(heartbeat_loop())
+
+    async def _reconnect(self) -> None:
+        """重连。"""
+        self._reconnect_attempts += 1
+
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
+
+        if self._ws:
+            await self._ws.close()
+            self._ws = None
+
+        delay = min(60, 2 ** self._reconnect_attempts)
+        logger.info(f"[{self.name}] Reconnecting in {delay}s (attempt {self._reconnect_attempts})")
+        await asyncio.sleep(delay)
 
     async def stop(self) -> None:
         """停止 QQ Bot。"""
         self._running = False
-        if self._client:
-            try:
-                await self._client.close()
-            except Exception:
-                pass
-        
-        # 保存 msg_seq 状态
-        await self._save_msg_seq_state()
-        
+
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
+
+        if self._api:
+            await self._api.close()
+            self._api = None
+
+        if self._ws:
+            await self._ws.close()
+            self._ws = None
+
         logger.info(f"[{self.name}] QQ bot stopped")
 
-    async def _load_msg_seq_state(self):
-        """从文件加载 msg_seq 计数器状态"""
-        state_file = Path.home() / ".iflow-bot" / "qq_msg_seq_state.json"
-        try:
-            if state_file.exists():
-                import json
-                with open(state_file, 'r', encoding='utf-8') as f:
-                    loaded_data = json.load(f)
-
-                # 迁移旧格式：如果加载的数据是纯数字字典，转换为新格式
-                # 旧格式：{"D35E1F44...": 5} 直接存储群 ID
-                # 新格式：{"group_D35E1F44...": 5, "group_D35E1F44..._thinking": 1005}
-                self._group_msg_seq = {}
-                for key, value in loaded_data.items():
-                    if not key.startswith("group_"):
-                        # 旧格式，转换为新格式
-                        self._group_msg_seq[f"group_{key}"] = value
-                        logger.info(f"[{self.name}] Migrated old seq key '{key}' -> 'group_{key}' = {value}")
-                    else:
-                        self._group_msg_seq[key] = value
-
-                logger.info(f"[{self.name}] Loaded msg_seq state: {len(self._group_msg_seq)} counters")
-                for k, v in self._group_msg_seq.items():
-                    logger.debug(f"[{self.name}]   {k}: {v}")
-            else:
-                logger.info(f"[{self.name}] No msg_seq state file found, starting fresh")
-        except Exception as e:
-            logger.warning(f"[{self.name}] Failed to load msg_seq state: {e}")
-            self._group_msg_seq = {}
-    
-    async def _save_msg_seq_state(self):
-        """保存 msg_seq 计数器状态到文件"""
-        state_file = Path.home() / ".iflow-bot" / "qq_msg_seq_state.json"
-        try:
-            state_file.parent.mkdir(parents=True, exist_ok=True)
-            import json
-            with open(state_file, 'w', encoding='utf-8') as f:
-                json.dump(self._group_msg_seq, f, ensure_ascii=False, indent=2)
-            logger.info(f"[{self.name}] Saved msg_seq state: {len(self._group_msg_seq)} groups")
-        except Exception as e:
-            logger.warning(f"[{self.name}] Failed to save msg_seq state: {e}")
-
     async def send(self, msg: OutboundMessage) -> None:
-        """通过 QQ 发送消息。
-
-        Args:
-            msg: 出站消息对象
-                - chat_id: 用户 openid 或群 ID
-                - content: 消息内容
-                - metadata: 包含 group_id(群聊) 或 openid(私聊)
-        """
-        logger.warning(f"[{self.name}] [DEBUG] send() called - chat_id={msg.chat_id}, content_len={len(msg.content)}, metadata={msg.metadata}")
-        
-        if not self._client:
-            logger.warning(f"[{self.name}] QQ client not initialized")
+        """发送 QQ 消息。"""
+        if not self._api:
+            logger.warning(f"[{self.name}] API not initialized")
             return
 
-        try:
-            metadata = msg.metadata or {}
-            content = msg.content
+        chat_id = msg.chat_id
+        content = msg.content
+        # 获取回复的消息 ID（用于被动回复）
+        reply_to_id = msg.metadata.get("reply_to_id") or msg.metadata.get("message_id")
 
-            if metadata.get("is_group"):
-                # 群聊消息 - 使用被动回复模式
-                group_id = metadata.get("group_id")
-                msg_id = metadata.get("reply_to_id") or metadata.get("message_id")
-                
-                logger.warning(f"[{self.name}] [DEBUG] Group message - group_id={group_id}, msg_id={msg_id}, metadata keys={list(metadata.keys())}")
-                
-                # 获取并递增 msg_seq（使用小整数）
-                # msg_seq 必须唯一且递增，不能循环重置，否则会被 QQ 服务器识别为重复消息
-                seq_key = f"group_{group_id}"
-                if seq_key not in self._group_msg_seq:
-                    self._group_msg_seq[seq_key] = 1
-                msg_seq = self._group_msg_seq[seq_key]
-                self._group_msg_seq[seq_key] += 1
-                # 注意：msg_seq 会一直递增（1, 2, 3, ...），永不重置
-                # QQ API 要求每个 (msg_id, msg_seq) 组合必须唯一
-                # 即使超过 1000 也不会重复使用已用过的值
-                
-                if self.config.markdown_support:
-                    # Markdown 模式
-                    logger.warning(f"[{self.name}] [DEBUG] Sending group message to {group_id}, msg_id={msg_id}, msg_seq={msg_seq}, markdown=true")
-                    try:
-                        # 构建 payload
-                        payload = {
-                            "msg_type": 2,  # markdown 类型
-                            "msg_id": msg_id,
-                            "msg_seq": msg_seq,
-                            "markdown": {"content": content}
-                        }
-                        logger.warning(f"[{self.name}] [DEBUG] Payload: {payload}")
-                        
-                        # 使用底层 HTTP 客户端发送请求
-                        from botpy.http import Route
-                        route = Route("POST", f"/v2/groups/{group_id}/messages", group_openid=group_id)
-                        await self._client.api._http.request(route, json=payload)
-                    except Exception as e:
-                        logger.error(f"[{self.name}] Error sending Markdown message: {e}")
-                        raise
-                else:
-                    # 纯文本模式
-                    logger.debug(f"[{self.name}] Sending group message to {group_id}, msg_id={msg_id}, msg_seq={msg_seq}, markdown=false")
-                    await self._client.api.post_group_message(
-                        group_openid=group_id,
-                        msg_type=0,  # 文本消息类型
-                        msg_id=msg_id,
+        # 消息分块
+        max_len = 2000
+        chunks = self._chunk_message(content, max_len)
+
+        for i, chunk in enumerate(chunks):
+            msg_seq = i + 1
+            try:
+                if chat_id.startswith("group:"):
+                    group_openid = chat_id[6:]
+                    await self._api.send_group_message(
+                        group_openid=group_openid,
+                        content=chunk,
                         msg_seq=msg_seq,
-                        content=content,
+                        msg_id=reply_to_id,  # 被动回复需要
                     )
-            else:
-                # 私聊消息
-                openid = msg.chat_id
-                if self.config.markdown_support:
-                    # Markdown 模式：使用底层 HTTP 客户端手动构建 payload
-                    logger.debug(f"[{self.name}] Sending C2C message to {openid}, markdown=true")
-                    try:
-                        # 构建 payload，只包含必要字段
-                        payload = {
-                            "msg_type": 2,
-                            "markdown": {"content": content}
-                        }
-                        # 私聊消息的 msg_id 和 msg_seq 从 metadata 获取
-                        c2c_msg_id = metadata.get("reply_to_id") or metadata.get("message_id")
-                        if c2c_msg_id:
-                            payload["msg_id"] = c2c_msg_id
-                            payload["msg_seq"] = 1  # 私聊消息的 msg_seq 从 1 开始
-                        
-                        # 使用底层 HTTP 客户端发送请求
-                        from botpy.http import Route
-                        route = Route("POST", f"/v2/users/{openid}/messages")
-                        await self._client.api._http.request(route, json=payload)
-                    except Exception as e:
-                        logger.error(f"[{self.name}] Error sending Markdown message: {e}")
-                        raise
                 else:
-                    # 纯文本模式
-                    logger.debug(f"[{self.name}] Sending C2C message to {openid}, markdown=false")
-                    await self._client.api.post_c2c_message(
-                        openid=openid,
-                        msg_type=0,
-                        content=content,
+                    await self._api.send_c2c_message(
+                        openid=chat_id,
+                        content=chunk,
+                        msg_seq=msg_seq,
+                        msg_id=reply_to_id,  # 被动回复需要
                     )
-            logger.debug(f"[{self.name}] Message sent to {msg.chat_id}")
-        except Exception as e:
-            logger.error(f"[{self.name}] Error sending message: {e}")
-
-    async def _on_c2c_message(self, data: "C2CMessage") -> None:
-        """处理来自 QQ 的 C2C 私聊消息。
-
-        Args:
-            data: QQ 消息对象
-        """
-        try:
-            # 消息 ID 去重
-            if data.id in self._processed_ids:
-                return
-            self._processed_ids.append(data.id)
-
-            # 提取用户信息
-            author = data.author
-            user_id = str(
-                getattr(author, 'id', None) or
-                getattr(author, 'user_openid', 'unknown')
-            )
-
-            # 提取消息内容
-            content = (data.content or "").strip()
-            if not content:
-                return
-
-            # 先发送 "Thinking..." 提示（非阻塞，不影响主流程）
-            try:
-                if self._client:
-                    await self._client.api.post_c2c_message(
-                        openid=user_id,
-                        msg_type=0,
-                        content="🤔 Thinking...",
-                    )
+                logger.debug(f"[{self.name}] Message chunk {i+1}/{len(chunks)} sent to {chat_id}")
             except Exception as e:
-                logger.debug(f"[{self.name}] Failed to send thinking: {e}")
+                logger.error(f"[{self.name}] Error sending message: {e}")
 
-            # 转发到消息总线
-            await self._handle_message(
-                sender_id=user_id,
-                chat_id=user_id,  # 私聊：chat_id == user_id
-                content=content,
-                metadata={"is_group": False},
-            )
+    def _chunk_message(self, text: str, limit: int = 2000) -> list[str]:
+        """分块长消息。"""
+        if len(text) <= limit:
+            return [text]
 
-        except Exception:
-            logger.exception(f"[{self.name}] Error handling C2C message")
+        chunks = []
+        remaining = text
 
-    async def _on_group_message(self, data: "GroupMessage") -> None:
-        """处理来自 QQ 群的 @机器人消息。
+        while remaining:
+            if len(remaining) <= limit:
+                chunks.append(remaining)
+                break
 
-        Args:
-            data: QQ 群消息对象
-        """
-        try:
-            # 消息 ID 去重
-            if data.id in self._processed_ids:
-                return
-            self._processed_ids.append(data.id)
+            # 尝试在换行处分割
+            split_at = remaining.rfind("\n", 0, limit)
+            if split_at < 0 or split_at < limit * 0.5:
+                split_at = remaining.rfind(" ", 0, limit)
+            if split_at < 0:
+                split_at = limit
 
-            # 检查是否在允许的群列表中
-            group_id = data.group_openid or ""
-            if self.config.groups and group_id not in self.config.groups:
-                logger.warning(f"[{self.name}] Message from unauthorized group: {group_id}")
-                return
+            chunks.append(remaining[:split_at])
+            remaining = remaining[split_at:].lstrip()
 
-            # 提取用户信息
-            author = data.author
-            user_id = str(
-                getattr(author, 'member_openid', None) or
-                getattr(author, 'user_openid', 'unknown')
-            )
-            username = user_id
-
-            # 提取消息内容
-            content = (data.content or "").strip()
-            if not content:
-                return
-
-            # 移除 @机器人 的部分
-            bot_id = getattr(self._client.robot, 'id', '') if self._client else ''
-            if bot_id:
-                content = content.replace(f'<@!{bot_id}>', '').strip()
-            if not content:
-                return
-
-            # 发送 "Thinking..." 提示（被动回复模式）
-            try:
-                if self._client:
-                    # 使用独立的 thinking 消息计数器，不和回复消息共用
-                    # 从 1000 开始，避免和回复消息（从 1 开始）冲突
-                    seq_key = f"group_{group_id}_thinking"
-                    if seq_key not in self._group_msg_seq:
-                        self._group_msg_seq[seq_key] = 1000
-                    thinking_msg_seq = self._group_msg_seq[seq_key]
-                    self._group_msg_seq[seq_key] += 1
-
-                    await self._client.api.post_group_message(
-                        group_openid=group_id,
-                        msg_type=0,
-                        content="🤔 Thinking...",
-                        msg_id=data.id,
-                        msg_seq=thinking_msg_seq,
-                    )
-            except Exception as e:
-                logger.debug(f"[{self.name}] Failed to send thinking: {e}")
-
-            # 转发到消息总线
-            chat_id = f"group_{group_id}"
-            await self._handle_message(
-                sender_id=user_id,
-                chat_id=chat_id,
-                content=content,
-                metadata={
-                    "message_id": data.id,  # 保存消息ID用于回复
-                    "is_group": True,
-                    "group_id": group_id,
-                    "username": username,
-                },
-            )
-
-        except Exception:
-            logger.exception(f"[{self.name}] Error handling group message")
+        return chunks
