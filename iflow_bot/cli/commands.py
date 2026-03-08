@@ -834,6 +834,26 @@ async def _run_gateway(config, verbose: bool = False) -> None:
             if hasattr(config, "driver") and config.driver
             else 8888
         ),
+        mcp_servers_auto_discover=(
+            getattr(config.driver, "mcp_servers_auto_discover", True)
+            if hasattr(config, "driver") and config.driver
+            else True
+        ),
+        mcp_servers_max=(
+            getattr(config.driver, "mcp_servers_max", 10)
+            if hasattr(config, "driver") and config.driver
+            else 10
+        ),
+        mcp_servers_allowlist=(
+            getattr(config.driver, "mcp_servers_allowlist", None)
+            if hasattr(config, "driver") and config.driver
+            else None
+        ),
+        mcp_servers_blocklist=(
+            getattr(config.driver, "mcp_servers_blocklist", None)
+            if hasattr(config, "driver") and config.driver
+            else None
+        ),
     )
     
     bus = MessageBus()
@@ -1140,6 +1160,16 @@ def sessions(
             getattr(config.driver, "mcp_proxy_port", 8888)
             if hasattr(config, "driver") and config.driver
             else 8888
+        ),
+        mcp_servers_auto_discover=(
+            getattr(config.driver, "mcp_servers_auto_discover", True)
+            if hasattr(config, "driver") and config.driver
+            else True
+        ),
+        mcp_servers_max=(
+            getattr(config.driver, "mcp_servers_max", 10)
+            if hasattr(config, "driver") and config.driver
+            else 10
         ),
     )
     mappings = adapter.session_mappings
@@ -1609,3 +1639,28 @@ def cron_run(
 
 if __name__ == "__main__":
     app()
+
+
+# ============================================================================
+# MCP 配置同步
+# ============================================================================
+
+@app.command()
+def mcp_sync(
+    overwrite: bool = typer.Option(False, "--overwrite", "-o", help="覆盖现有配置"),
+) -> None:
+    """从 iflow CLI 同步 MCP 服务器配置。
+
+    读取 iflow 的 settings.json，将 MCP 服务器配置复制到 iflow-bot。
+    配置会被保存到 ~/.iflow-bot/config/.mcp_proxy_config.json
+    """
+    from iflow_bot.utils.helpers import sync_mcp_from_iflow
+
+    console.print("[cyan]正在从 iflow CLI 同步 MCP 配置...[/cyan]")
+
+    if sync_mcp_from_iflow(overwrite=overwrite):
+        console.print(f"[green]{_OK_MARK}[/green] MCP 配置同步成功")
+        console.print("[dim]配置文件：~/.iflow-bot/config/.mcp_proxy_config.json[/dim]")
+        console.print("[dim]重启网关使配置生效：iflow-bot gateway restart[/dim]")
+    else:
+        console.print("[yellow]MCP 配置同步失败或无需同步[/yellow]")

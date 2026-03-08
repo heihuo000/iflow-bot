@@ -374,6 +374,67 @@ class ConsoleService:
                 running = False
         return {"running": running, "pid": pid}
 
+    async def get_mcp_proxy_status(self) -> dict[str, Any]:
+        """获取 MCP 代理状态."""
+        import subprocess
+        import aiohttp
+
+        # 检查 PID 文件 - 多路径查找
+        pid_file = self.home_dir.parent / "mcp_proxy.pid"
+        if not pid_file.exists():
+            # 降级到项目目录
+            pid_file = Path(__file__).resolve().parent.parent.parent / "mcp_proxy.pid"
+
+        pid: Optional[int] = None
+        running = False
+
+        if pid_file.exists():
+            try:
+                pid = int(pid_file.read_text(encoding="utf-8").strip())
+                running = _process_exists(pid)
+            except Exception:
+                pid = None
+                running = False
+
+        # 获取配置
+        config_file = self.home_dir / "config" / ".mcp_proxy_config.json"
+        mcp_config = {}
+        if config_file.exists():
+            try:
+                mcp_config = json.loads(config_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        # 健康检查
+        health_info: dict[str, Any] = {"status": "unknown", "servers": []}
+        if running:
+            try:
+                # 从配置获取端口
+                cfg = self.get_config_obj()
+                port = cfg.driver.mcp_proxy_port if cfg.driver else 8888
+
+                async def fetch_health():
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                            f"http://localhost:{port}/health",
+                            timeout=aiohttp.ClientTimeout(total=3)
+                        ) as resp:
+                            if resp.status == 200:
+                                return await resp.json()
+                    return {"status": "error", "servers": []}
+
+                health_info = await fetch_health()
+            except Exception as e:
+                health_info = {"status": "error", "message": str(e), "servers": []}
+
+        return {
+            "running": running,
+            "pid": pid,
+            "config_file": str(config_file),
+            "config": mcp_config.get("mcpServers", {}),
+            "health": health_info,
+        }
+
     def list_conversations(self, channel: str = "", keyword: str = "") -> list[dict[str, Any]]:
         records: list[dict[str, Any]] = []
         if not self.channel_dir.exists():
@@ -1663,6 +1724,66 @@ def create_app(token: str | None = None) -> FastAPI:
         if keyword:
             lines = [line for line in lines if keyword.lower() in line.lower()]
         return JSONResponse({"ok": True, "lines": lines, "cursor": cursor, "source": source})
+
+    @app.get("/api/mcp/status")
+    async def api_mcp_status(request: Request) -> JSONResponse:
+        """获取 MCP 代理状态。"""
+        _check_token(request)
+        status = await service.get_mcp_proxy_status()
+        return JSONResponse({"ok": True, "data": status})
+
+    @app.post("/api/mcp/restart")
+    async def api_mcp_restart(request: Request) -> JSONResponse:
+        """重启 MCP 代理。"""
+        _check_token(request)
+        import subprocess
+        from iflow_bot.cli.commands import start_mcp_proxy, check_mcp_proxy_running
+
+        cfg = service.get_config_obj()
+        port = cfg.driver.mcp_proxy_port if cfg.driver else 8888
+
+        try:
+            # 先检查是否已经在运行
+            if check_mcp_proxy_running(port):
+                # 停止现有的（通过 kill 进程）
+                pid_file = service.home_dir.parent / "mcp_proxy.pid"
+                if pid_file.exists():
+                    pid = int(pid_file.read_text(encoding="utf-8").strip())
+                    os.kill(pid, 9)
+                    await asyncio.sleep(1)
+
+            # 启动新的实例
+            if start_mcp_proxy(port):
+                return JSONResponse({"ok": True, "message": "MCP 代理已重启"})
+            else:
+                return JSONResponse({"ok": False, "message": "MCP 代理启动失败"}, status_code=500)
+        except Exception as e:
+            return JSONResponse({"ok": False, "message": str(e)}, status_code=500)
+
+    @app.post("/api/mcp/sync")
+    async def api_mcp_sync(request: Request) -> JSONResponse:
+        """从 iflow CLI 同步 MCP 配置。"""
+        _check_token(request)
+        from iflow_bot.utils.helpers import sync_mcp_from_iflow
+
+        try:
+            if sync_mcp_from_iflow(overwrite=False):
+                return JSONResponse({"ok": True, "message": "MCP 配置同步成功"})
+            else:
+                return JSONResponse({"ok": False, "message": "同步失败或无需同步"}, status_code=500)
+        except Exception as e:
+            return JSONResponse({"ok": False, "message": str(e)}, status_code=500)
+
+    @app.get("/mcp", response_class=HTMLResponse)
+    async def mcp_page(request: Request) -> HTMLResponse:
+        """MCP 代理状态页面。"""
+        _check_token(request)
+        token = request.query_params.get("token", "")
+        status = await service.get_mcp_proxy_status()
+        return templates.TemplateResponse(
+            "mcp.html",
+            {"request": request, "page": "mcp", "mcp_status": status, "token": token or ""},
+        )
 
     return app
 

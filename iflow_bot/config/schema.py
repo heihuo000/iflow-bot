@@ -198,12 +198,24 @@ class DriverConfig(BaseModel):
     # MCP 代理配置
     mcp_proxy_enabled: bool = True
     """是否启用 MCP 代理（共享 MCP 服务器以减少资源消耗）"""
-    
+
     mcp_proxy_port: int = 8888
     """MCP 代理服务器的端口号"""
-    
+
     mcp_proxy_auto_start: bool = True
     """是否在启动网关时自动启动 MCP 代理"""
+
+    mcp_servers_auto_discover: bool = True
+    """是否自动从 MCP 代理发现启用的服务器（替代硬编码）"""
+
+    mcp_servers_max: int = 10
+    """单个 iflow 实例最多连接的 MCP 服务器数量（防止资源耗尽）"""
+
+    mcp_servers_allowlist: list[str] = Field(default_factory=list)
+    """允许使用的 MCP 服务器名称列表（空表示使用代理中的所有服务器）"""
+
+    mcp_servers_blocklist: list[str] = Field(default_factory=list)
+    """禁用的 MCP 服务器名称列表（优先级高于 allowlist）"""
 
 
 # ============================================================================

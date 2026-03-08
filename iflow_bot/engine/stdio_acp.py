@@ -116,11 +116,21 @@ class StdioACPClient:
         workspace: Optional[Path] = None,
         timeout: int = DEFAULT_TIMEOUT,
         mcp_proxy_port: int = 8888,
+        mcp_servers_auto_discover: bool = True,
+        mcp_servers_max: int = 10,
+        mcp_servers_allowlist: Optional[list[str]] = None,
+        mcp_servers_blocklist: Optional[list[str]] = None,
+        mcp_servers_cached: Optional[list[dict]] = None,
     ):
         self.iflow_path = iflow_path
         self.workspace = workspace or Path.cwd()
         self.timeout = timeout
         self.mcp_proxy_port = mcp_proxy_port
+        self.mcp_servers_auto_discover = mcp_servers_auto_discover
+        self.mcp_servers_max = mcp_servers_max
+        self.mcp_servers_allowlist = mcp_servers_allowlist or []
+        self.mcp_servers_blocklist = mcp_servers_blocklist or []
+        self.mcp_servers_cached = mcp_servers_cached
         
         self._process: Optional[asyncio.subprocess.Process] = None
         self._started = False
@@ -390,7 +400,41 @@ class StdioACPClient:
         logger.info(f"StdioACP initialized: version={result.get('protocolVersion')}")
         
         return self._agent_capabilities
-    
+
+    async def _get_mcp_servers(self) -> list[dict]:
+        """获取 MCP 服务器列表。
+
+        优先级：
+        1. 使用预缓存的服务器列表 (mcp_servers_cached)
+        2. 自动从 MCP 代理发现 (mcp_servers_auto_discover=True)
+        3. 降级为空列表（让 iflow 使用其默认配置）
+        """
+        # 优先使用预缓存的列表（由外部传入）
+        if self.mcp_servers_cached:
+            logger.debug(f"Using cached MCP servers: {len(self.mcp_servers_cached)}")
+            return self.mcp_servers_cached
+
+        # 自动发现
+        if self.mcp_servers_auto_discover:
+            try:
+                from iflow_bot.utils.helpers import discover_mcp_servers
+                servers = await discover_mcp_servers(
+                    proxy_port=self.mcp_proxy_port,
+                    allowlist=self.mcp_servers_allowlist or None,
+                    blocklist=self.mcp_servers_blocklist or None,
+                    max_servers=self.mcp_servers_max,
+                )
+                if servers:
+                    return servers
+            except ImportError as e:
+                logger.warning(f"Failed to import discover_mcp_servers: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to discover MCP servers: {e}")
+
+        # 降级：返回空列表，让 iflow 使用其默认配置
+        logger.debug("No MCP servers configured, using empty list")
+        return []
+
     async def authenticate(self, method_id: str = "iflow") -> bool:
         """进行认证。"""
         if not self._initialized:
@@ -421,27 +465,8 @@ class StdioACPClient:
         
         ws_path = str(workspace or self.workspace)
         
-        # 使用 HTTP 模式连接共享的 MCP 服务器
-        # 从配置获取 MCP 代理端口
-        mcp_proxy_port = getattr(self, 'mcp_proxy_port', 8888)
-        
-        mcp_servers = [
-            {
-                "name": "github",
-                "type": "http",
-                "url": f"http://localhost:{mcp_proxy_port}/github"
-            },
-            {
-                "name": "dnf-rag",
-                "type": "http",
-                "url": f"http://localhost:{mcp_proxy_port}/dnf-rag"
-            },
-            {
-                "name": "message-board",
-                "type": "http",
-                "url": f"http://localhost:{mcp_proxy_port}/message-board"
-            }
-        ]
+        # 获取 MCP 服务器列表（动态发现或缓存）
+        mcp_servers = await self._get_mcp_servers()
         
         params: dict = {
             "cwd": ws_path,
@@ -763,6 +788,11 @@ class StdioACPAdapter:
         thinking: bool = False,
         active_compress_trigger_tokens: int = 88888,
         mcp_proxy_port: int = 8888,
+        mcp_servers_auto_discover: bool = True,
+        mcp_servers_max: int = 10,
+        mcp_servers_allowlist: Optional[list[str]] = None,
+        mcp_servers_blocklist: Optional[list[str]] = None,
+        mcp_servers_cached: Optional[list[dict]] = None,
     ):
         self.iflow_path = iflow_path
         self.workspace = workspace
@@ -770,6 +800,11 @@ class StdioACPAdapter:
         self.default_model = default_model
         self.thinking = thinking
         self.mcp_proxy_port = mcp_proxy_port
+        self.mcp_servers_auto_discover = mcp_servers_auto_discover
+        self.mcp_servers_max = mcp_servers_max
+        self.mcp_servers_allowlist = mcp_servers_allowlist or []
+        self.mcp_servers_blocklist = mcp_servers_blocklist or []
+        self.mcp_servers_cached = mcp_servers_cached
         
         self._client: Optional[StdioACPClient] = None
         self._session_map: dict[str, str] = {}
@@ -1001,6 +1036,11 @@ TOOLS.md - Your Tools（你的工具）定义了你可以使用的工具列表�
                 workspace=self.workspace,
                 timeout=self.timeout,
                 mcp_proxy_port=self.mcp_proxy_port,
+                mcp_servers_auto_discover=self.mcp_servers_auto_discover,
+                mcp_servers_max=self.mcp_servers_max,
+                mcp_servers_allowlist=self.mcp_servers_allowlist,
+                mcp_servers_blocklist=self.mcp_servers_blocklist,
+                mcp_servers_cached=self.mcp_servers_cached,
             )
         
         await self._client.start()

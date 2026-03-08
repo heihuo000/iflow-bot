@@ -15,6 +15,7 @@
       <a data-i18n="nav.chat" class="{{ 'active' if page == 'chat' else '' }}" href="/chat{% if token %}?token={{ token }}{% endif %}">Web 对话</a>
       <a data-i18n="nav.conversations" class="{{ 'active' if page == 'conversations' else '' }}" href="/conversations{% if token %}?token={{ token }}{% endif %}">全渠道对话</a>
       <a data-i18n="nav.config" class="{{ 'active' if page == 'config' else '' }}" href="/config{% if token %}?token={{ token }}{% endif %}">配置中心</a>
+      <a data-i18n="nav.mcp" class="{{ 'active' if page == 'mcp' else '' }}" href="/mcp{% if token %}?token={{ token }}{% endif %}">MCP 代理</a>
       <a data-i18n="nav.logs" class="{{ 'active' if page == 'logs' else '' }}" href="/logs{% if token %}?token={{ token }}{% endif %}">实时日志</a>
       <select id="console-lang-switch" class="lang-switch" aria-label="Language">
         <option value="zh-CN">中文</option>

@@ -119,6 +119,10 @@ class IFlowAdapter:
         acp_port: int = 8090,
         compression_trigger_tokens: int = 88888,
         mcp_proxy_port: int = 8888,
+        mcp_servers_auto_discover: bool = True,
+        mcp_servers_max: int = 10,
+        mcp_servers_allowlist: Optional[list[str]] = None,
+        mcp_servers_blocklist: Optional[list[str]] = None,
     ):
         self.default_model = default_model
         self.thinking = thinking
@@ -129,6 +133,10 @@ class IFlowAdapter:
         self.acp_port = acp_port
         self.compression_trigger_tokens = max(0, int(compression_trigger_tokens))
         self.mcp_proxy_port = mcp_proxy_port
+        self.mcp_servers_auto_discover = mcp_servers_auto_discover
+        self.mcp_servers_max = mcp_servers_max
+        self.mcp_servers_allowlist = mcp_servers_allowlist or []
+        self.mcp_servers_blocklist = mcp_servers_blocklist or []
         
         # workspace 是 iflow 执行的工作目录
         if workspace:
@@ -187,6 +195,10 @@ class IFlowAdapter:
                 thinking=self.thinking,
                 active_compress_trigger_tokens=self.compression_trigger_tokens,
                 mcp_proxy_port=self.mcp_proxy_port,
+                mcp_servers_auto_discover=self.mcp_servers_auto_discover,
+                mcp_servers_max=self.mcp_servers_max,
+                mcp_servers_allowlist=self.mcp_servers_allowlist,
+                mcp_servers_blocklist=self.mcp_servers_blocklist,
             )
             await self._stdio_adapter.connect()
             logger.info(f"StdioACP adapter connected")
