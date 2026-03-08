@@ -1,14 +1,18 @@
 """QQ channel implementation using qq-botpy SDK.
 
 使用 qq-botpy SDK 通过 WebSocket 连接 QQ 频道机器人。
-支持 C2C 私聊消息和 QQ 群消息。
+支持 C2C 私聊消息、QQ 群消息、图片、语音富文本。
 """
 
 import asyncio
+import base64
 import logging
+import os
 from collections import deque
 from pathlib import Path
 from typing import Any, Optional, TYPE_CHECKING
+
+import aiohttp
 
 from iflow_bot.bus.events import OutboundMessage
 from iflow_bot.bus.queue import MessageBus
@@ -31,6 +35,13 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+# QQ 媒体类型
+class MediaType:
+    IMAGE = "image"
+    VOICE = "voice"
+    FILE = "file"
+    VIDEO = "video"
 
 
 def _make_bot_class(channel: "QQChannel") -> Any:
@@ -88,6 +99,11 @@ class QQChannel(BaseChannel):
         self._client: Any = None
         self._processed_ids: deque = deque(maxlen=1000)
         self._group_msg_seq: dict[str, int] = {}  # 群消息序号计数器
+        self._media_cache: dict[str, dict] = {}  # 媒体文件信息缓存 (file_info)
+
+        # AccessToken 缓存
+        self._access_token: Optional[str] = None
+        self._token_expires_at: int = 0
 
     async def start(self) -> None:
         """启动 QQ Bot。"""
@@ -184,6 +200,327 @@ class QQChannel(BaseChannel):
         except Exception as e:
             logger.warning(f"[{self.name}] Failed to save msg_seq state: {e}")
 
+    # ========== AccessToken 管理 ==========
+
+    async def _get_access_token(self) -> str:
+        """获取 AccessToken（带缓存）。"""
+        if self._access_token and asyncio.get_event_loop().time() < self._token_expires_at:
+            return self._access_token
+
+        # 获取新 Token
+        token_url = "https://bots.qq.com/app/getAppAccessToken"
+        payload = {"appId": self.config.app_id, "clientSecret": self.config.secret}
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(token_url, json=payload) as resp:
+                data = await resp.json()
+                if not data.get("access_token"):
+                    raise RuntimeError(f"Failed to get access_token: {data}")
+
+                self._access_token = data["access_token"]
+                # 提前 5 分钟过期
+                expires_in = int(data.get("expires_in", 7200))
+                self._token_expires_at = asyncio.get_event_loop().time() + expires_in - 300
+                logger.debug(f"[{self.name}] AccessToken refreshed, expires in {expires_in}s")
+                return self._access_token
+
+    # ========== 媒体上传 API ==========
+
+    async def _upload_c2c_media(
+        self,
+        access_token: str,
+        openid: str,
+        media_type: str,
+        file_url: Optional[str] = None,
+        file_data: Optional[str] = None,
+        file_name: Optional[str] = None,
+    ) -> dict:
+        """上传 C2C 媒体文件。
+
+        Args:
+            access_token: API 访问令牌
+            openid: 用户 openid
+            media_type: 媒体类型 (image, voice, file, video)
+            file_url: 公网 URL
+            file_data: Base64 数据
+            file_name: 文件名（文件类型需要）
+        """
+        api_url = f"https://api.sgroup.qq.com/v2/users/{openid}/c2c/files"
+        headers = {"Authorization": f"QQBot {access_token}", "Content-Type": "application/json"}
+
+        # 构建 payload
+        payload = {"file_type": media_type}
+        if file_url:
+            payload["url"] = file_url
+        elif file_data:
+            payload["file_data"] = file_data
+        if file_name:
+            payload["file_name"] = file_name
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(api_url, headers=headers, json=payload) as resp:
+                result = await resp.json()
+                if resp.status != 200:
+                    raise RuntimeError(f"Upload C2C media failed: {result}")
+                return result
+
+    async def _upload_group_media(
+        self,
+        access_token: str,
+        group_openid: str,
+        media_type: str,
+        file_url: Optional[str] = None,
+        file_data: Optional[str] = None,
+        file_name: Optional[str] = None,
+    ) -> dict:
+        """上传群媒体文件。
+
+        Args:
+            access_token: API 访问令牌
+            group_openid: 群 openid
+            media_type: 媒体类型 (image, voice, file, video)
+            file_url: 公网 URL
+            file_data: Base64 数据
+            file_name: 文件名（文件类型需要）
+        """
+        api_url = f"https://api.sgroup.qq.com/v2/groups/{group_openid}/files"
+        headers = {"Authorization": f"QQBot {access_token}", "Content-Type": "application/json"}
+
+        payload = {"file_type": media_type}
+        if file_url:
+            payload["url"] = file_url
+        elif file_data:
+            payload["file_data"] = file_data
+        if file_name:
+            payload["file_name"] = file_name
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(api_url, headers=headers, json=payload) as resp:
+                result = await resp.json()
+                if resp.status != 200:
+                    raise RuntimeError(f"Upload group media failed: {result}")
+                return result
+
+    # ========== 媒体消息发送 API ==========
+
+    async def _send_c2c_media_message(
+        self,
+        access_token: str,
+        openid: str,
+        file_info: str,
+        msg_id: Optional[str] = None,
+        content: Optional[str] = None,
+        media_type: str = "image",
+    ) -> dict:
+        """发送 C2C 媒体消息。
+
+        Args:
+            access_token: API 访问令牌
+            openid: 用户 openid
+            file_info: 上传后返回的 file_info
+            msg_id: 回复的消息 ID
+            content: 附带的文本内容
+            media_type: 媒体类型
+        """
+        api_url = f"https://api.sgroup.qq.com/v2/users/{openid}/messages"
+        headers = {"Authorization": f"QQBot {access_token}", "Content-Type": "application/json"}
+
+        payload = {
+            "msg_type": 7,  # 富媒体消息
+            "media": {"file_info": file_info},
+        }
+        if msg_id:
+            payload["msg_id"] = msg_id
+            payload["msg_seq"] = 1
+        if content:
+            payload["content"] = content
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(api_url, headers=headers, json=payload) as resp:
+                result = await resp.json()
+                if resp.status not in (200, 202):
+                    logger.error(f"Send C2C media message failed: {result}")
+                return result
+
+    async def _send_group_media_message(
+        self,
+        access_token: str,
+        group_openid: str,
+        file_info: str,
+        msg_id: Optional[str] = None,
+        msg_seq: int = 1,
+        content: Optional[str] = None,
+        media_type: str = "image",
+    ) -> dict:
+        """发送群媒体消息。
+
+        Args:
+            access_token: API 访问令牌
+            group_openid: 群 openid
+            file_info: 上传后返回的 file_info
+            msg_id: 回复的消息 ID
+            msg_seq: 消息序号
+            content: 附带的文本内容
+            media_type: 媒体类型
+        """
+        api_url = f"https://api.sgroup.qq.com/v2/groups/{group_openid}/messages"
+        headers = {"Authorization": f"QQBot {access_token}", "Content-Type": "application/json"}
+
+        payload = {
+            "msg_type": 7,  # 富媒体消息
+            "media": {"file_info": file_info},
+            "msg_id": msg_id,
+            "msg_seq": msg_seq,
+        }
+        if content:
+            payload["content"] = content
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(api_url, headers=headers, json=payload) as resp:
+                result = await resp.json()
+                if resp.status not in (200, 202):
+                    logger.error(f"Send group media message failed: {result}")
+                return result
+
+    # ========== 富媒体发送封装 ==========
+
+    async def _send_image(
+        self,
+        access_token: str,
+        chat_id: str,
+        image_url: str,
+        msg_id: Optional[str] = None,
+        msg_seq: Optional[int] = None,
+        is_group: bool = False,
+        content: Optional[str] = None,
+    ) -> None:
+        """发送图片消息。
+
+        Args:
+            access_token: API 访问令牌
+            chat_id: 用户 openid 或群 openid
+            image_url: 图片 URL 或 Base64 Data URL
+            msg_id: 回复的消息 ID
+            msg_seq: 群消息序号
+            is_group: 是否群聊
+            content: 附带的文本内容
+        """
+        try:
+            # 检查是否是 Base64
+            file_data = None
+            file_url = None
+            if image_url.startswith("data:"):
+                # Base64: data:image/png;base64,xxxxx
+                match = image_url.match(r'^data:([^;]+);base64,(.+)$')
+                if match:
+                    file_data = match.group(2)
+                else:
+                    file_data = image_url.split(",", 1)[1] if "," in image_url else image_url
+            else:
+                file_url = image_url
+
+            # 上传
+            if is_group:
+                result = await self._upload_group_media(
+                    access_token, chat_id, MediaType.IMAGE, file_url, file_data
+                )
+            else:
+                result = await self._upload_c2c_media(
+                    access_token, chat_id, MediaType.IMAGE, file_url, file_data
+                )
+
+            file_info = result.get("file_info", "")
+
+            # 发送
+            if is_group:
+                await self._send_group_media_message(
+                    access_token, chat_id, file_info, msg_id, msg_seq, content, MediaType.IMAGE
+                )
+            else:
+                await self._send_c2c_media_message(
+                    access_token, chat_id, file_info, msg_id, content, MediaType.IMAGE
+                )
+
+            logger.info(f"[{self.name}] Image sent to {chat_id}")
+        except Exception as e:
+            logger.error(f"[{self.name}] Failed to send image: {e}")
+            # 降级发送文本
+            if content:
+                await self._send_text(access_token, chat_id, content, msg_id, msg_seq, is_group)
+
+    async def _send_voice(
+        self,
+        access_token: str,
+        chat_id: str,
+        voice_data: str,
+        msg_id: Optional[str] = None,
+        msg_seq: Optional[int] = None,
+        is_group: bool = False,
+    ) -> None:
+        """发送语音消息。
+
+        Args:
+            access_token: API 访问令牌
+            chat_id: 用户 openid 或群 openid
+            voice_data: Base64 编码的语音数据（SILK 格式）
+            msg_id: 回复的消息 ID
+            msg_seq: 群消息序号
+            is_group: 是否群聊
+        """
+        try:
+            if is_group:
+                result = await self._upload_group_media(
+                    access_token, chat_id, MediaType.VOICE, None, voice_data
+                )
+                await self._send_group_media_message(
+                    access_token, chat_id, result.get("file_info", ""), msg_id, msg_seq, None, MediaType.VOICE
+                )
+            else:
+                result = await self._upload_c2c_media(
+                    access_token, chat_id, MediaType.VOICE, None, voice_data
+                )
+                await self._send_c2c_media_message(
+                    access_token, chat_id, result.get("file_info", ""), msg_id, None, MediaType.VOICE
+                )
+
+            logger.info(f"[{self.name}] Voice sent to {chat_id}")
+        except Exception as e:
+            logger.error(f"[{self.name}] Failed to send voice: {e}")
+
+    async def _send_text(
+        self,
+        access_token: str,
+        chat_id: str,
+        content: str,
+        msg_id: Optional[str] = None,
+        msg_seq: Optional[int] = None,
+        is_group: bool = False,
+    ) -> None:
+        """发送纯文本消息（底层方法）。"""
+        if is_group:
+            api_url = f"https://api.sgroup.qq.com/v2/groups/{chat_id}/messages"
+            payload = {
+                "msg_type": 0,
+                "content": content,
+                "msg_id": msg_id,
+                "msg_seq": msg_seq or 1,
+            }
+        else:
+            api_url = f"https://api.sgroup.qq.com/v2/users/{chat_id}/messages"
+            payload = {
+                "msg_type": 0,
+                "content": content,
+            }
+            if msg_id:
+                payload["msg_id"] = msg_id
+                payload["msg_seq"] = 1
+
+        headers = {"Authorization": f"QQBot {access_token}", "Content-Type": "application/json"}
+        async with aiohttp.ClientSession() as session:
+            async with session.post(api_url, headers=headers, json=payload) as resp:
+                if resp.status not in (200, 202):
+                    logger.error(f"Send text message failed: {await resp.text()}")
+
     async def send(self, msg: OutboundMessage) -> None:
         """通过 QQ 发送消息。
 
@@ -191,10 +528,11 @@ class QQChannel(BaseChannel):
             msg: 出站消息对象
                 - chat_id: 用户 openid 或群 ID
                 - content: 消息内容
+                - media: 媒体文件列表（图片、语音等）
                 - metadata: 包含 group_id(群聊) 或 openid(私聊)
         """
-        logger.warning(f"[{self.name}] [DEBUG] send() called - chat_id={msg.chat_id}, content_len={len(msg.content)}, metadata={msg.metadata}")
-        
+        logger.debug(f"[{self.name}] send() called - chat_id={msg.chat_id}, content_len={len(msg.content)}, media_count={len(msg.media)}, metadata={msg.metadata}")
+
         if not self._client:
             logger.warning(f"[{self.name}] QQ client not initialized")
             return
@@ -202,51 +540,55 @@ class QQChannel(BaseChannel):
         try:
             metadata = msg.metadata or {}
             content = msg.content
+            media_files = msg.media or []
+            is_group = metadata.get("is_group", False)
+            group_id = metadata.get("group_id") if is_group else None
+            msg_id = metadata.get("reply_to_id") or metadata.get("message_id")
 
-            if metadata.get("is_group"):
-                # 群聊消息 - 使用被动回复模式
-                group_id = metadata.get("group_id")
-                msg_id = metadata.get("reply_to_id") or metadata.get("message_id")
-                
-                logger.warning(f"[{self.name}] [DEBUG] Group message - group_id={group_id}, msg_id={msg_id}, metadata keys={list(metadata.keys())}")
-                
-                # 获取并递增 msg_seq（使用小整数）
-                # msg_seq 必须唯一且递增，不能循环重置，否则会被 QQ 服务器识别为重复消息
+            # 获取 AccessToken（用于媒体上传）
+            access_token = await self._get_access_token() if media_files else None
+
+            # 群聊 msg_seq 管理
+            msg_seq = None
+            if is_group and group_id:
                 seq_key = f"group_{group_id}"
                 if seq_key not in self._group_msg_seq:
                     self._group_msg_seq[seq_key] = 1
                 msg_seq = self._group_msg_seq[seq_key]
                 self._group_msg_seq[seq_key] += 1
-                # 注意：msg_seq 会一直递增（1, 2, 3, ...），永不重置
-                # QQ API 要求每个 (msg_id, msg_seq) 组合必须唯一
-                # 即使超过 1000 也不会重复使用已用过的值
-                
+
+            # 优先处理媒体消息（图片、语音等）
+            if media_files:
+                for media_path in media_files:
+                    await self._send_media_file(
+                        access_token=access_token,
+                        chat_id=msg.chat_id,
+                        media_path=media_path,
+                        msg_id=msg_id,
+                        msg_seq=msg_seq,
+                        is_group=is_group,
+                        content=content if media_path == media_files[0] else None,
+                    )
+                return
+
+            # 纯文本/Markdown 消息
+            if is_group:
                 if self.config.markdown_support:
-                    # Markdown 模式
-                    logger.warning(f"[{self.name}] [DEBUG] Sending group message to {group_id}, msg_id={msg_id}, msg_seq={msg_seq}, markdown=true")
-                    try:
-                        # 构建 payload
-                        payload = {
-                            "msg_type": 2,  # markdown 类型
-                            "msg_id": msg_id,
-                            "msg_seq": msg_seq,
-                            "markdown": {"content": content}
-                        }
-                        logger.warning(f"[{self.name}] [DEBUG] Payload: {payload}")
-                        
-                        # 使用底层 HTTP 客户端发送请求
-                        from botpy.http import Route
-                        route = Route("POST", f"/v2/groups/{group_id}/messages", group_openid=group_id)
-                        await self._client.api._http.request(route, json=payload)
-                    except Exception as e:
-                        logger.error(f"[{self.name}] Error sending Markdown message: {e}")
-                        raise
+                    logger.debug(f"[{self.name}] Sending group Markdown to {group_id}, msg_seq={msg_seq}")
+                    payload = {
+                        "msg_type": 2,
+                        "msg_id": msg_id,
+                        "msg_seq": msg_seq,
+                        "markdown": {"content": content}
+                    }
+                    from botpy.http import Route
+                    route = Route("POST", f"/v2/groups/{group_id}/messages", group_openid=group_id)
+                    await self._client.api._http.request(route, json=payload)
                 else:
-                    # 纯文本模式
-                    logger.debug(f"[{self.name}] Sending group message to {group_id}, msg_id={msg_id}, msg_seq={msg_seq}, markdown=false")
+                    logger.debug(f"[{self.name}] Sending group text to {group_id}, msg_seq={msg_seq}")
                     await self._client.api.post_group_message(
                         group_openid=group_id,
-                        msg_type=0,  # 文本消息类型
+                        msg_type=0,
                         msg_id=msg_id,
                         msg_seq=msg_seq,
                         content=content,
@@ -255,38 +597,118 @@ class QQChannel(BaseChannel):
                 # 私聊消息
                 openid = msg.chat_id
                 if self.config.markdown_support:
-                    # Markdown 模式：使用底层 HTTP 客户端手动构建 payload
-                    logger.debug(f"[{self.name}] Sending C2C message to {openid}, markdown=true")
-                    try:
-                        # 构建 payload，只包含必要字段
-                        payload = {
-                            "msg_type": 2,
-                            "markdown": {"content": content}
-                        }
-                        # 私聊消息的 msg_id 和 msg_seq 从 metadata 获取
-                        c2c_msg_id = metadata.get("reply_to_id") or metadata.get("message_id")
-                        if c2c_msg_id:
-                            payload["msg_id"] = c2c_msg_id
-                            payload["msg_seq"] = 1  # 私聊消息的 msg_seq 从 1 开始
-                        
-                        # 使用底层 HTTP 客户端发送请求
-                        from botpy.http import Route
-                        route = Route("POST", f"/v2/users/{openid}/messages")
-                        await self._client.api._http.request(route, json=payload)
-                    except Exception as e:
-                        logger.error(f"[{self.name}] Error sending Markdown message: {e}")
-                        raise
+                    logger.debug(f"[{self.name}] Sending C2C Markdown to {openid}")
+                    payload = {
+                        "msg_type": 2,
+                        "markdown": {"content": content}
+                    }
+                    c2c_msg_id = metadata.get("reply_to_id") or metadata.get("message_id")
+                    if c2c_msg_id:
+                        payload["msg_id"] = c2c_msg_id
+                        payload["msg_seq"] = 1
+                    from botpy.http import Route
+                    route = Route("POST", f"/v2/users/{openid}/messages")
+                    await self._client.api._http.request(route, json=payload)
                 else:
-                    # 纯文本模式
-                    logger.debug(f"[{self.name}] Sending C2C message to {openid}, markdown=false")
+                    logger.debug(f"[{self.name}] Sending C2C text to {openid}")
                     await self._client.api.post_c2c_message(
                         openid=openid,
                         msg_type=0,
                         content=content,
                     )
+
             logger.debug(f"[{self.name}] Message sent to {msg.chat_id}")
         except Exception as e:
             logger.error(f"[{self.name}] Error sending message: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+
+    async def _send_media_file(
+        self,
+        access_token: str,
+        chat_id: str,
+        media_path: str,
+        msg_id: Optional[str] = None,
+        msg_seq: Optional[int] = None,
+        is_group: bool = False,
+        content: Optional[str] = None,
+    ) -> None:
+        """发送媒体文件（图片、语音、文件等）。
+
+        Args:
+            access_token: API 访问令牌
+            chat_id: 用户 openid 或群 openid
+            media_path: 本地文件路径或 URL
+            msg_id: 回复的消息 ID
+            msg_seq: 群消息序号
+            is_group: 是否群聊
+            content: 附带的文本内容
+        """
+        try:
+            # 判断文件类型
+            lower_path = media_path.lower()
+            if any(ext in lower_path for ext in [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"]):
+                media_type = MediaType.IMAGE
+            elif any(ext in lower_path for ext in [".amr", ".silk", ".slk", ".wav", ".mp3"]):
+                media_type = MediaType.VOICE
+            elif any(ext in lower_path for ext in [".mp4", ".avi", ".mov", ".mkv"]):
+                media_type = MediaType.VIDEO
+            else:
+                media_type = MediaType.FILE
+
+            # 读取文件为 Base64
+            if media_path.startswith(("http://", "https://")):
+                # URL 直接使用
+                file_url = media_path
+                file_data = None
+            elif os.path.exists(media_path):
+                # 本地文件读取为 Base64
+                with open(media_path, "rb") as f:
+                    file_data = base64.b64encode(f.read()).decode("utf-8")
+                file_url = None
+            else:
+                logger.error(f"[{self.name}] Media file not found: {media_path}")
+                return
+
+            # 根据类型发送
+            if media_type == MediaType.IMAGE:
+                await self._send_image(
+                    access_token, chat_id, file_url or f"data:image/jpeg;base64,{file_data}",
+                    msg_id, msg_seq, is_group, content
+                )
+            elif media_type == MediaType.VOICE:
+                await self._send_voice(access_token, chat_id, file_data, msg_id, msg_seq, is_group)
+            elif media_type == MediaType.VIDEO:
+                # TODO: 视频消息
+                logger.warning(f"[{self.name}] Video sending not yet implemented, falling back to text")
+                if content:
+                    await self._send_text(access_token, chat_id, content, msg_id, msg_seq, is_group)
+            else:
+                # 文件类型
+                file_name = os.path.basename(media_path)
+                if is_group:
+                    result = await self._upload_group_media(
+                        access_token, chat_id, MediaType.FILE, file_url, file_data, file_name
+                    )
+                    await self._send_group_media_message(
+                        access_token, chat_id, result.get("file_info", ""), msg_id, msg_seq, None, MediaType.FILE
+                    )
+                else:
+                    result = await self._upload_c2c_media(
+                        access_token, chat_id, MediaType.FILE, file_url, file_data, file_name
+                    )
+                    await self._send_c2c_media_message(
+                        access_token, chat_id, result.get("file_info", ""), msg_id, None, MediaType.FILE
+                    )
+
+            logger.info(f"[{self.name}] Media sent: {media_path}")
+        except Exception as e:
+            logger.error(f"[{self.name}] Failed to send media: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            # 降级发送文本
+            if content:
+                await self._send_text(access_token, chat_id, content, msg_id, msg_seq, is_group)
 
     async def _on_c2c_message(self, data: "C2CMessage") -> None:
         """处理来自 QQ 的 C2C 私聊消息。
