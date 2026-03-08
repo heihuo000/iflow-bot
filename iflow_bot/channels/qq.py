@@ -7,6 +7,7 @@
 import asyncio
 import logging
 from collections import deque
+from pathlib import Path
 from typing import Any, Optional, TYPE_CHECKING
 
 from iflow_bot.bus.events import OutboundMessage
@@ -100,6 +101,9 @@ class QQChannel(BaseChannel):
             logger.error(f"[{self.name}] app_id and secret not configured")
             return
 
+        # 加载持久化的 msg_seq 状态
+        await self._load_msg_seq_state()
+
         self._running = True
         BotClass = _make_bot_class(self)
         self._client = BotClass()
@@ -117,6 +121,9 @@ class QQChannel(BaseChannel):
                 )
             except Exception as e:
                 logger.warning(f"[{self.name}] QQ bot error: {e}")
+            finally:
+                # 连接断开时保存 msg_seq 状态
+                await self._save_msg_seq_state()
             if self._running:
                 logger.info(f"[{self.name}] Reconnecting in 5 seconds...")
                 await asyncio.sleep(5)
@@ -129,7 +136,53 @@ class QQChannel(BaseChannel):
                 await self._client.close()
             except Exception:
                 pass
+        
+        # 保存 msg_seq 状态
+        await self._save_msg_seq_state()
+        
         logger.info(f"[{self.name}] QQ bot stopped")
+
+    async def _load_msg_seq_state(self):
+        """从文件加载 msg_seq 计数器状态"""
+        state_file = Path.home() / ".iflow-bot" / "qq_msg_seq_state.json"
+        try:
+            if state_file.exists():
+                import json
+                with open(state_file, 'r', encoding='utf-8') as f:
+                    loaded_data = json.load(f)
+
+                # 迁移旧格式：如果加载的数据是纯数字字典，转换为新格式
+                # 旧格式：{"D35E1F44...": 5} 直接存储群 ID
+                # 新格式：{"group_D35E1F44...": 5, "group_D35E1F44..._thinking": 1005}
+                self._group_msg_seq = {}
+                for key, value in loaded_data.items():
+                    if not key.startswith("group_"):
+                        # 旧格式，转换为新格式
+                        self._group_msg_seq[f"group_{key}"] = value
+                        logger.info(f"[{self.name}] Migrated old seq key '{key}' -> 'group_{key}' = {value}")
+                    else:
+                        self._group_msg_seq[key] = value
+
+                logger.info(f"[{self.name}] Loaded msg_seq state: {len(self._group_msg_seq)} counters")
+                for k, v in self._group_msg_seq.items():
+                    logger.debug(f"[{self.name}]   {k}: {v}")
+            else:
+                logger.info(f"[{self.name}] No msg_seq state file found, starting fresh")
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to load msg_seq state: {e}")
+            self._group_msg_seq = {}
+    
+    async def _save_msg_seq_state(self):
+        """保存 msg_seq 计数器状态到文件"""
+        state_file = Path.home() / ".iflow-bot" / "qq_msg_seq_state.json"
+        try:
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            import json
+            with open(state_file, 'w', encoding='utf-8') as f:
+                json.dump(self._group_msg_seq, f, ensure_ascii=False, indent=2)
+            logger.info(f"[{self.name}] Saved msg_seq state: {len(self._group_msg_seq)} groups")
+        except Exception as e:
+            logger.warning(f"[{self.name}] Failed to save msg_seq state: {e}")
 
     async def send(self, msg: OutboundMessage) -> None:
         """通过 QQ 发送消息。
@@ -140,6 +193,8 @@ class QQChannel(BaseChannel):
                 - content: 消息内容
                 - metadata: 包含 group_id(群聊) 或 openid(私聊)
         """
+        logger.warning(f"[{self.name}] [DEBUG] send() called - chat_id={msg.chat_id}, content_len={len(msg.content)}, metadata={msg.metadata}")
+        
         if not self._client:
             logger.warning(f"[{self.name}] QQ client not initialized")
             return
@@ -149,29 +204,35 @@ class QQChannel(BaseChannel):
             content = msg.content
 
             if metadata.get("is_group"):
-                # 群聊消息 - 需要找到原始消息对象来回复
+                # 群聊消息 - 使用被动回复模式
                 group_id = metadata.get("group_id")
                 msg_id = metadata.get("reply_to_id") or metadata.get("message_id")
-                # 获取并递增 msg_seq（每个群独立计数）
+                
+                logger.warning(f"[{self.name}] [DEBUG] Group message - group_id={group_id}, msg_id={msg_id}, metadata keys={list(metadata.keys())}")
+                
+                # 获取并递增 msg_seq（使用小整数）
+                # msg_seq 必须唯一且递增，不能循环重置，否则会被 QQ 服务器识别为重复消息
                 seq_key = f"group_{group_id}"
                 if seq_key not in self._group_msg_seq:
                     self._group_msg_seq[seq_key] = 1
                 msg_seq = self._group_msg_seq[seq_key]
                 self._group_msg_seq[seq_key] += 1
+                # 注意：msg_seq 会一直递增（1, 2, 3, ...），永不重置
+                # QQ API 要求每个 (msg_id, msg_seq) 组合必须唯一
+                # 即使超过 1000 也不会重复使用已用过的值
                 
                 if self.config.markdown_support:
-                    # Markdown 模式：使用底层 HTTP 客户端手动构建 payload
-                    logger.debug(f"[{self.name}] Sending group message to {group_id}, msg_seq={msg_seq}, markdown=true")
-                    logger.debug(f"[{self.name}] Content preview: {content[:100] if len(content) > 100 else content}")
+                    # Markdown 模式
+                    logger.warning(f"[{self.name}] [DEBUG] Sending group message to {group_id}, msg_id={msg_id}, msg_seq={msg_seq}, markdown=true")
                     try:
-                        # 构建 payload，只包含必要字段（参考 qqbot-main）
+                        # 构建 payload
                         payload = {
-                            "msg_type": 2,
+                            "msg_type": 2,  # markdown 类型
+                            "msg_id": msg_id,
                             "msg_seq": msg_seq,
                             "markdown": {"content": content}
                         }
-                        if msg_id:
-                            payload["msg_id"] = msg_id
+                        logger.warning(f"[{self.name}] [DEBUG] Payload: {payload}")
                         
                         # 使用底层 HTTP 客户端发送请求
                         from botpy.http import Route
@@ -182,7 +243,7 @@ class QQChannel(BaseChannel):
                         raise
                 else:
                     # 纯文本模式
-                    logger.debug(f"[{self.name}] Sending group message to {group_id}, msg_seq={msg_seq}, markdown=false")
+                    logger.debug(f"[{self.name}] Sending group message to {group_id}, msg_id={msg_id}, msg_seq={msg_seq}, markdown=false")
                     await self._client.api.post_group_message(
                         group_openid=group_id,
                         msg_type=0,  # 文本消息类型
@@ -267,7 +328,7 @@ class QQChannel(BaseChannel):
                 sender_id=user_id,
                 chat_id=user_id,  # 私聊：chat_id == user_id
                 content=content,
-                metadata={"message_id": data.id, "is_group": False},
+                metadata={"is_group": False},
             )
 
         except Exception:
@@ -311,21 +372,26 @@ class QQChannel(BaseChannel):
             if not content:
                 return
 
-            # 发送 "Thinking..." 提示（使用 API 发送，避免持有 data 对象引用）
+            # 发送 "Thinking..." 提示（被动回复模式）
             try:
                 if self._client:
+                    # 使用独立的 thinking 消息计数器，不和回复消息共用
+                    # 从 1000 开始，避免和回复消息（从 1 开始）冲突
+                    seq_key = f"group_{group_id}_thinking"
+                    if seq_key not in self._group_msg_seq:
+                        self._group_msg_seq[seq_key] = 1000
+                    thinking_msg_seq = self._group_msg_seq[seq_key]
+                    self._group_msg_seq[seq_key] += 1
+
                     await self._client.api.post_group_message(
                         group_openid=group_id,
                         msg_type=0,
                         content="🤔 Thinking...",
                         msg_id=data.id,
-                        msg_seq=1,
+                        msg_seq=thinking_msg_seq,
                     )
             except Exception as e:
                 logger.debug(f"[{self.name}] Failed to send thinking: {e}")
-            finally:
-                # 确保 data 对象可以被垃圾回收
-                del data
 
             # 转发到消息总线
             chat_id = f"group_{group_id}"
@@ -334,7 +400,7 @@ class QQChannel(BaseChannel):
                 chat_id=chat_id,
                 content=content,
                 metadata={
-                    "message_id": data.id,
+                    "message_id": data.id,  # 保存消息ID用于回复
                     "is_group": True,
                     "group_id": group_id,
                     "username": username,
