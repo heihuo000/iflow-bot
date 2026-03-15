@@ -37,6 +37,8 @@ try:
         PatchMessageRequest,
         PatchMessageRequestBody,
         P2ImMessageReceiveV1,
+        P2ImMessageReactionCreatedV1,
+        P2ImMessageReactionDeletedV1,
     )
     FEISHU_AVAILABLE = True
 except ImportError:
@@ -193,50 +195,102 @@ def _extract_element_content(element: dict) -> list[str]:
 
 
 def _extract_post_text(content_json: dict) -> str:
-    """Extract plain text from Feishu post (rich text) message content.
+    """Extract plain text from Feishu post (rich text) message content."""
 
-    Supports two formats:
-    1. Direct format: {"title": "...", "content": [...]}
-    2. Localized format: {"zh_cn": {"title": "...", "content": [...]}}
+    parts, _ = _extract_post_parts(content_json)
+    text = "\n".join(p for p in parts if p).strip()
+    return text
+
+
+
+def _extract_post_parts(content_json: dict) -> tuple[list[str], list[dict[str, Any]]]:
+    """Extract text parts and embedded resource references from Feishu post content.
+
+    Returns:
+        (text_parts, resources)
+        resources item example:
+          {"type": "image", "image_key": "..."}
+          {"type": "file", "file_key": "..."}
+          {"type": "media", "file_key": "..."}
     """
-    def extract_from_lang(lang_content: dict) -> Optional[str]:
+
+    def walk_element(element: Any, text_parts: list[str], resources: list[dict[str, Any]]) -> None:
+        if not isinstance(element, dict):
+            return
+
+        tag = element.get("tag")
+        if tag == "text":
+            text = element.get("text", "")
+            if text:
+                text_parts.append(text)
+        elif tag == "a":
+            text = element.get("text", "")
+            href = element.get("href", "")
+            if text:
+                text_parts.append(text)
+            if href:
+                text_parts.append(f"link: {href}")
+        elif tag == "at":
+            text_parts.append(f"@{element.get('user_name', 'user')}")
+        elif tag == "img":
+            image_key = element.get("image_key") or element.get("file_key")
+            alt = element.get("alt", "") or "[image]"
+            text_parts.append(str(alt))
+            if image_key:
+                resources.append({"type": "image", "image_key": image_key})
+        elif tag in ("file", "media", "audio"):
+            file_key = element.get("file_key")
+            name = element.get("file_name") or element.get("name") or f"[{tag}]"
+            text_parts.append(str(name))
+            if file_key:
+                resources.append({"type": tag, "file_key": file_key})
+        elif tag == "emotion":
+            text_parts.append(element.get("emoji_type", "[emoji]"))
+        elif tag == "table":
+            text_parts.append("[table]")
+        else:
+            # recursively walk nested containers
+            for key in ("elements", "content", "columns", "fields", "children"):
+                value = element.get(key)
+                if isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, list):
+                            for sub in item:
+                                walk_element(sub, text_parts, resources)
+                        else:
+                            walk_element(item, text_parts, resources)
+
+    def extract_from_lang(lang_content: dict) -> tuple[list[str], list[dict[str, Any]]]:
         if not isinstance(lang_content, dict):
-            return None
+            return [], []
         title = lang_content.get("title", "")
         content_blocks = lang_content.get("content", [])
         if not isinstance(content_blocks, list):
-            return None
-        text_parts = []
+            return [], []
+
+        text_parts: list[str] = []
+        resources: list[dict[str, Any]] = []
         if title:
             text_parts.append(title)
         for block in content_blocks:
             if not isinstance(block, list):
                 continue
             for element in block:
-                if isinstance(element, dict):
-                    tag = element.get("tag")
-                    if tag == "text":
-                        text_parts.append(element.get("text", ""))
-                    elif tag == "a":
-                        text_parts.append(element.get("text", ""))
-                    elif tag == "at":
-                        text_parts.append(f"@{element.get('user_name', 'user')}")
-        return " ".join(text_parts).strip() if text_parts else None
+                walk_element(element, text_parts, resources)
+        return text_parts, resources
 
-    # Try direct format first
     if "content" in content_json:
-        result = extract_from_lang(content_json)
-        if result:
-            return result
+        text_parts, resources = extract_from_lang(content_json)
+        if text_parts or resources:
+            return text_parts, resources
 
-    # Try localized format
     for lang_key in ("zh_cn", "en_us", "ja_jp"):
         lang_content = content_json.get(lang_key)
-        result = extract_from_lang(lang_content)
-        if result:
-            return result
+        text_parts, resources = extract_from_lang(lang_content)
+        if text_parts or resources:
+            return text_parts, resources
 
-    return ""
+    return [], []
 
 
 @register_channel("feishu")
@@ -307,12 +361,16 @@ class FeishuChannel(BaseChannel):
             .log_level(lark.LogLevel.ERROR) \
             .build()
 
-        # Create event handler (only register message receive)
+        # Create event handler (register message receive and reaction events)
         event_handler = lark.EventDispatcherHandler.builder(
             self.config.encrypt_key or "",
             self.config.verification_token or "",
         ).register_p2_im_message_receive_v1(
             self._on_message_sync
+        ).register_p2_im_message_reaction_created_v1(
+            self._on_reaction_created_sync
+        ).register_p2_im_message_reaction_deleted_v1(
+            self._on_reaction_deleted_sync
         ).build()
 
         # Create WebSocket client for long connection
@@ -332,12 +390,12 @@ class FeishuChannel(BaseChannel):
                     # 关键修复：lark_oapi/ws/client.py 在模块级别调用 asyncio.get_event_loop()
                     # 并保存在模块变量中。我们需要替换这个变量为新线程的事件循环
                     import lark_oapi.ws.client as ws_client_module
-                    
+
                     # 创建新的事件循环并替换模块变量
                     new_loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(new_loop)
                     ws_client_module.loop = new_loop
-                    
+
                     # 现在可以安全地调用 start()
                     self._ws_client.start()
                 except Exception as e:
@@ -575,7 +633,8 @@ class FeishuChannel(BaseChannel):
             (file_path, content_text) - file_path is None if download failed
         """
         loop = asyncio.get_running_loop()
-        media_dir = Path.home() / ".iflow-bot" / "media"
+        from iflow_bot.utils.helpers import get_workspace_dir
+        media_dir = get_workspace_dir() / "images"
         media_dir.mkdir(parents=True, exist_ok=True)
 
         data: Optional[bytes] = None
@@ -937,6 +996,14 @@ class FeishuChannel(BaseChannel):
         except Exception as e:
             logger.error(f"Error sending Feishu message: {e}")
 
+    def _on_reaction_created_sync(self, data: "P2ImMessageReactionCreatedV1") -> None:
+        """Handle message reaction created event (no-op, just to suppress errors)."""
+        pass
+
+    def _on_reaction_deleted_sync(self, data: "P2ImMessageReactionDeletedV1") -> None:
+        """Handle message reaction deleted event (no-op, just to suppress errors)."""
+        pass
+
     def _on_message_sync(self, data: "P2ImMessageReceiveV1") -> None:
         """Sync handler for incoming messages (called from WebSocket thread).
 
@@ -975,7 +1042,7 @@ class FeishuChannel(BaseChannel):
             chat_type = message.chat_type
             msg_type = message.message_type
 
-            # 秒回“敲键盘”反应，作为处理中提示
+            # 秒回"敲键盘"反应，作为处理中提示
             typing_reaction_id = await self._add_reaction(message_id, "OnIt")
             if typing_reaction_id:
                 self._typing_reaction_ids[message_id] = typing_reaction_id
@@ -995,9 +1062,26 @@ class FeishuChannel(BaseChannel):
                     content_parts.append(text)
 
             elif msg_type == "post":
-                text = _extract_post_text(content_json)
-                if text:
-                    content_parts.append(text)
+                text_parts, resources = _extract_post_parts(content_json)
+                if text_parts:
+                    content_parts.extend(text_parts)
+                for resource in resources:
+                    resource_type = resource.get("type")
+                    if resource_type == "image":
+                        file_path, content_text = await self._download_and_save_media(
+                            "image", resource, message_id
+                        )
+                    elif resource_type in ("file", "media", "audio"):
+                        file_path, content_text = await self._download_and_save_media(
+                            resource_type, resource, message_id
+                        )
+                    else:
+                        file_path, content_text = None, f"[{resource_type}]"
+
+                    if file_path:
+                        media_paths.append(file_path)
+                    if content_text:
+                        content_parts.append(content_text)
 
             elif msg_type in ("image", "audio", "file", "media"):
                 file_path, content_text = await self._download_and_save_media(

@@ -142,6 +142,12 @@ class TelegramChannel(BaseChannel):
     BOT_COMMANDS = [
         BotCommand("start", "Start the bot"),
         BotCommand("new", "Start a new conversation"),
+        BotCommand("status", "Show current status"),
+        BotCommand("compact", "Compact current session"),
+        BotCommand("cron", "Manage cron jobs"),
+        BotCommand("model", "Set model"),
+        BotCommand("skills", "Manage skills"),
+        BotCommand("language", "Set language"),
         BotCommand("help", "Show available commands"),
     ]
     
@@ -176,8 +182,13 @@ class TelegramChannel(BaseChannel):
         
         # Command handlers
         self._app.add_handler(CommandHandler("start", self._on_start))
-        self._app.add_handler(CommandHandler("new", self._forward_command))
-        self._app.add_handler(CommandHandler("help", self._on_help))
+        # Forward all other commands to the engine (so slash commands work consistently)
+        self._app.add_handler(
+            MessageHandler(
+                filters.COMMAND & ~filters.Regex(r"^/start(@|\\s|$)"),
+                self._forward_command,
+            )
+        )
         
         # Message handler
         self._app.add_handler(
@@ -438,7 +449,8 @@ class TelegramChannel(BaseChannel):
         if media_file and self._app:
             try:
                 file = await self._app.bot.get_file(media_file.file_id)
-                media_dir = Path.home() / ".iflow-bot" / "media"
+                from iflow_bot.utils.helpers import get_workspace_dir
+                media_dir = get_workspace_dir() / "images"
                 media_dir.mkdir(parents=True, exist_ok=True)
                 
                 ext = Path(file.file_path).suffix if file.file_path else ""

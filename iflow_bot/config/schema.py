@@ -161,6 +161,16 @@ class ChannelsConfig(BaseModel):
 
 
 # ============================================================================
+# 文案配置
+# ============================================================================
+
+class MessagesConfig(BaseModel):
+    model_config = {"extra": "ignore"}
+
+    new_conversation: str = "✨ New conversation started, previous context has been cleared."
+
+
+# ============================================================================
 # Driver 配置（iflow 设置）
 # ============================================================================
 
@@ -239,6 +249,9 @@ class Config(BaseSettings):
 
     # 渠道配置
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
+
+    # 文案配置
+    messages: MessagesConfig = Field(default_factory=MessagesConfig)
 
     # 日志
     log_level: str = "INFO"

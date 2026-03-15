@@ -6,7 +6,7 @@
     "yolo": true,
     "thinking": false,
     "max_turns": 40,
-    "timeout": 180,
+    "timeout": 600,
     "workspace": "/root/.iflow-bot/workspace",
     "extra_args": []
   },
@@ -42,6 +42,9 @@
       "allow_from": [],
       "group_policy": "mention"
     }
+  },
+  "messages": {
+    "new_conversation": "✨ New conversation started, previous context has been cleared."
   },
   "log_level": "INFO",
   "log_file": ""

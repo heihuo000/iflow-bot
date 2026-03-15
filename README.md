@@ -168,7 +168,7 @@ Configuration file located at `~/.iflow-bot/config.json`
     "yolo": true,
     "thinking": false,
     "max_turns": 40,
-    "timeout": 180,
+    "timeout": 600,
     "workspace": "~/.iflow-bot/workspace",
     "extra_args": []
   },
@@ -245,6 +245,9 @@ Configuration file located at `~/.iflow-bot/config.json`
       "panels": ["*"]
     }
   },
+  "messages": {
+    "new_conversation": "✨ New conversation started, previous context has been cleared."
+  },
   "log_level": "INFO",
   "log_file": ""
 }
@@ -260,7 +263,7 @@ Configuration file located at `~/.iflow-bot/config.json`
 | `yolo` | bool | `true` | Auto-confirm mode |
 | `thinking` | bool | `false` | Show AI thinking process |
 | `max_turns` | int | `40` | Maximum conversation turns per session |
-| `timeout` | int | `180` | Timeout in seconds |
+| `timeout` | int | `600` | Timeout in seconds |
 | `workspace` | string | `~/.iflow-bot/workspace` | Workspace path |
 | `extra_args` | list | `[]` | Additional iflow arguments |
 | `acp_port` | int | `8090` | Port for ACP mode |
@@ -606,6 +609,36 @@ iflow-bot skill --help
 
 # Commands
 iflow-bot commands --help
+```
+
+### Chat Slash Commands
+
+These commands are sent inside your chat app (Telegram/Feishu/DingTalk/etc.):
+
+```
+/status                 Show status (model, session, compression count)
+/new                    Start a new conversation
+/compact                Manually compact current conversation
+/help                   Show help
+/cron list              List scheduled tasks
+/cron add ...           Add a task (see /help for args). In chat, channel/to auto-filled and deliver defaults to true
+/cron delete <id>       Delete a task
+/model set <name>       Switch model for new sessions
+/language <en-US|zh-CN> Set language
+/skills find <keyword>  Search skills (SkillHub)
+/skills add <slug>      Install skill to workspace/skills
+/skills list            List installed skills
+/skills remove <slug>   Uninstall skill
+/skills update          Upgrade installed skills
+```
+
+### SkillHub CLI (for /skills)
+
+`/skills` uses SkillHub CLI. If it is missing, the bot will auto-install it.
+You can also install it manually:
+
+```bash
+curl -fsSL https://skillhub-1388575217.cos.ap-guangzhou.myqcloud.com/install/install.sh | bash -s -- --cli-only
 ```
 
 ## 📁 Directory Structure

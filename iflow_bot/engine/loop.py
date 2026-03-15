@@ -81,6 +81,475 @@ class AgentLoop:
 
         logger.info(f"AgentLoop initialized with model={model}, workspace={self.workspace}, streaming={streaming}")
 
+    def _get_new_conversation_message(self) -> str:
+        """获取新会话提示文案（可配置）。"""
+        if self.channel_manager and getattr(self.channel_manager, "config", None):
+            try:
+                messages = getattr(self.channel_manager.config, "messages", None)
+                if messages and getattr(messages, "new_conversation", None):
+                    return str(messages.new_conversation)
+            except Exception:
+                pass
+        return "✨ New conversation started, previous context has been cleared."
+
+    async def _send_command_reply(self, msg: InboundMessage, content: str) -> None:
+        await self.bus.publish_outbound(OutboundMessage(
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            content=content,
+            metadata=self._build_reply_metadata(msg),
+        ))
+
+    def _build_help_text(self) -> str:
+        return (
+            "可用命令：\n"
+            "/status  查看当前状态\n"
+            "/new     开启新会话\n"
+            "/compact 手动压缩会话\n"
+            "/model set <name>  修改模型\n"
+            "/cron list | /cron add | /cron delete <id>\n"
+            "/skills find|add|list|remove|update  管理 Skills（SkillHub）\n"
+            "/language <en-US|zh-CN>  设置语言\n"
+            "/help    查看帮助\n"
+        )
+
+    async def _handle_slash_command(self, msg: InboundMessage) -> bool:
+        import shlex
+        from datetime import datetime
+        from iflow_bot.config.loader import load_config, save_config
+        from iflow_bot.cron.service import CronService
+        from iflow_bot.cron.types import CronSchedule
+        from iflow_bot.utils.platform import prepare_subprocess_command
+        import re
+
+        def _strip_ansi(text: str) -> str:
+            if not text:
+                return ""
+            # Remove ANSI escape sequences and other terminal control codes
+            text = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
+            text = re.sub(r"\x1b\][^\x07]*\x07", "", text)  # OSC
+            text = re.sub(r"\x1b\\", "", text)
+            # Remove other non-printable control chars except \n and \t
+            text = "".join(ch for ch in text if ch == "\n" or ch == "\t" or ord(ch) >= 32)
+            return text.strip()
+
+        def _find_skillhub_binary() -> Optional[str]:
+            import shutil
+
+            candidates = [
+                shutil.which("skillhub"),
+                str(Path.home() / ".local" / "bin" / "skillhub"),
+            ]
+            for item in candidates:
+                if item and Path(item).exists():
+                    return item
+            return None
+
+        async def _ensure_skillhub_cli() -> tuple[Optional[str], Optional[str], bool]:
+            path = _find_skillhub_binary()
+            if path:
+                return path, None, False
+
+            install_cmd = (
+                "curl -fsSL https://skillhub-1388575217.cos.ap-guangzhou.myqcloud.com/install/install.sh "
+                "| bash -s -- --cli-only"
+            )
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "bash",
+                    "-lc",
+                    install_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
+                if proc.returncode != 0:
+                    err = (stderr or stdout or b"").decode("utf-8", errors="replace").strip()
+                    return None, err or "SkillHub CLI 安装失败", False
+            except Exception as e:
+                return None, str(e), False
+
+            path = _find_skillhub_binary()
+            if not path:
+                return None, "SkillHub CLI 安装完成但未找到可执行文件", False
+            return path, None, True
+
+        def _format_skillhub_search_output(text: str) -> str:
+            if not text:
+                return text
+            lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+            entries: list[dict[str, str]] = []
+            current: dict[str, str] | None = None
+            for line in lines:
+                if line.startswith("You can use"):
+                    continue
+                if not line.startswith(" "):
+                    if current:
+                        entries.append(current)
+                    parts = line.split(None, 1)
+                    slug = parts[0].strip()
+                    title = parts[1].strip() if len(parts) > 1 else ""
+                    current = {"slug": slug, "title": title, "desc": "", "version": ""}
+                else:
+                    if not current:
+                        continue
+                    item = line.strip()
+                    if item.startswith("- "):
+                        content = item[2:].strip()
+                        if content.startswith("version:"):
+                            current["version"] = content.replace("version:", "").strip()
+                        elif not current["desc"]:
+                            current["desc"] = content
+            if current:
+                entries.append(current)
+            if not entries:
+                return text
+            formatted = ["技能搜索结果（用 /skills add <slug> 安装）："]
+            for idx, entry in enumerate(entries, start=1):
+                title = f"（{entry['title']}）" if entry["title"] else ""
+                ver = f" v{entry['version']}" if entry["version"] else ""
+                formatted.append(f"[{idx}] {entry['slug']}{title}{ver}")
+                if entry["desc"]:
+                    formatted.append(f"    {entry['desc']}")
+                formatted.append(f"    /skills add {entry['slug']}")
+            return "\n".join(formatted)
+
+        def _format_skillhub_list_output(text: str) -> str:
+            if not text:
+                return "暂无已安装技能"
+            if "No installed skills." in text:
+                return "暂无已安装技能"
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            formatted = ["已安装技能："]
+            for line in lines:
+                formatted.append(f"- {line}")
+            return "\n".join(formatted)
+
+        def _format_skillhub_install_output(text: str, slug: str) -> str:
+            m = re.search(r"Installed:\\s*([^\\s]+)\\s*->\\s*(.+)$", text, re.M)
+            if m:
+                installed = m.group(1).strip()
+                path = m.group(2).strip()
+                return f"✅ 已安装 {installed}\n路径: {path}"
+            if text:
+                return text
+            return f"✅ 已安装 {slug}"
+
+        raw = (msg.content or "").strip()
+        if not raw.startswith("/"):
+            return False
+
+        try:
+            parts = shlex.split(raw)
+        except Exception:
+            parts = raw.split()
+
+        if not parts:
+            return False
+
+        cmd = parts[0].lower()
+        if "@" in cmd:
+            cmd = cmd.split("@", 1)[0]
+        args = parts[1:]
+
+        if cmd in {"/help"}:
+            await self._send_command_reply(msg, self._build_help_text())
+            return True
+
+        if cmd in {"/new", "/start"}:
+            return False
+
+        if cmd == "/status":
+            adapter = self.adapter
+            mode = getattr(adapter, "mode", "cli")
+            model = self.model
+            workspace = str(self.workspace) if self.workspace else "unknown"
+            streaming = "on" if self.streaming else "off"
+            compression_count = "-"
+            session_id = "-"
+            est_tokens = "-"
+
+            try:
+                if mode == "stdio":
+                    stdio = await adapter._get_stdio_adapter()
+                    info = stdio.get_session_status(msg.channel, msg.chat_id)
+                    compression_count = str(info.get("compression_count", "-"))
+                    session_id = info.get("session_id", "-")
+                    est_tokens = info.get("estimated_tokens", "-")
+            except Exception:
+                pass
+
+            await self._send_command_reply(
+                msg,
+                "\n".join([
+                    f"状态: {mode}",
+                    f"模型: {model}",
+                    f"流式: {streaming}",
+                    f"workspace: {workspace}",
+                    f"session: {session_id}",
+                    f"上下文估算(tokens): {est_tokens}",
+                    f"压缩次数: {compression_count}",
+                ]),
+            )
+            return True
+
+        if cmd == "/compact":
+            try:
+                if getattr(self.adapter, "mode", "cli") == "stdio":
+                    stdio = await self.adapter._get_stdio_adapter()
+                    ok, reason = await stdio.compact_session(msg.channel, msg.chat_id)
+                    if ok:
+                        await self._send_command_reply(msg, "✅ 已触发会话压缩")
+                    else:
+                        await self._send_command_reply(msg, f"⚠️ 无法压缩：{reason}")
+                else:
+                    await self._send_command_reply(msg, "⚠️ 当前模式不支持手动压缩")
+            except Exception as e:
+                await self._send_command_reply(msg, f"❌ 压缩失败: {e}")
+            return True
+
+        if cmd == "/model" and len(args) >= 2 and args[0].lower() == "set":
+            new_model = args[1]
+            cfg = load_config()
+            if hasattr(cfg, "driver") and cfg.driver:
+                cfg.driver.model = new_model
+            save_config(cfg)
+            self.model = new_model
+            try:
+                self.adapter.default_model = new_model
+                if getattr(self.adapter, "_stdio_adapter", None):
+                    self.adapter._stdio_adapter.default_model = new_model
+            except Exception:
+                pass
+            await self._send_command_reply(msg, f"✅ 已切换模型为 {new_model}（新会话生效）")
+            return True
+
+        if cmd == "/cron":
+            from iflow_bot.utils.helpers import get_data_dir
+            store_path = get_data_dir() / "cron" / "jobs.json"
+            cron = CronService(store_path)
+            sub = (args[0].lower() if args else "help")
+
+            if sub == "list":
+                jobs = cron.list_jobs(include_disabled=True)
+                if not jobs:
+                    await self._send_command_reply(msg, "暂无定时任务")
+                else:
+                    lines = []
+                    for job in jobs:
+                        sched = job.schedule.kind
+                        if sched == "every":
+                            sched = f"every {int(job.schedule.every_ms/1000)}s"
+                        elif sched == "cron":
+                            sched = f"cron {job.schedule.expr}"
+                        elif sched == "at":
+                            ts = job.schedule.at_ms / 1000 if job.schedule.at_ms else 0
+                            sched = f"at {datetime.fromtimestamp(ts).isoformat(sep=' ')}"
+                        lines.append(f"{job.id} | {job.name} | {sched} | enabled={job.enabled}")
+                    await self._send_command_reply(msg, "定时任务：\n" + "\n".join(lines))
+                return True
+
+            if sub == "delete" and len(args) >= 2:
+                job_id = args[1]
+                removed = cron.remove_job(job_id)
+                await self._send_command_reply(msg, "✅ 已删除" if removed else "⚠️ 未找到该任务")
+                return True
+
+            if sub == "add":
+                # 简易参数解析：--name/--message/--every/--cron/--at/--tz/--channel/--to/--deliver
+                opts = {}
+                key = None
+                for token in args[1:]:
+                    if token.startswith("--"):
+                        key = token[2:]
+                        opts[key] = ""
+                    else:
+                        if key:
+                            if opts[key]:
+                                opts[key] += " " + token
+                            else:
+                                opts[key] = token
+                name = opts.get("name", "cron")
+                message = opts.get("message")
+                if not message:
+                    await self._send_command_reply(msg, "⚠️ 缺少 --message")
+                    return True
+                tz = opts.get("tz")
+                every = opts.get("every")
+                cron_expr = opts.get("cron")
+                at = opts.get("at")
+                if sum(1 for x in [every, cron_expr, at] if x) != 1:
+                    await self._send_command_reply(msg, "⚠️ 需要指定 --every 或 --cron 或 --at 其中之一")
+                    return True
+                if every:
+                    schedule = CronSchedule(kind="every", every_ms=int(every) * 1000)
+                elif cron_expr:
+                    schedule = CronSchedule(kind="cron", expr=cron_expr, tz=tz)
+                else:
+                    when = datetime.fromisoformat(at)
+                    schedule = CronSchedule(kind="at", at_ms=int(when.timestamp() * 1000))
+                channel = opts.get("channel")
+                to = opts.get("to")
+                deliver_raw = opts.get("deliver")
+                if not channel and not to:
+                    channel = msg.channel
+                    to = msg.chat_id
+                    deliver = True if deliver_raw in {None, ""} else deliver_raw.lower() in {"1", "true", "yes"}
+                else:
+                    deliver = True if deliver_raw is None else deliver_raw.lower() in {"1", "true", "yes"}
+                job = cron.add_job(
+                    name=name,
+                    schedule=schedule,
+                    message=message,
+                    deliver=deliver,
+                    channel=channel,
+                    to=to,
+                    delete_after_run=False,
+                )
+                await self._send_command_reply(msg, f"✅ 已添加任务 {job.id}")
+                return True
+
+            await self._send_command_reply(
+                msg,
+                "用法：/cron list | /cron add --name xxx --message xxx --every 60 | /cron delete <id>",
+            )
+            return True
+
+        if cmd == "/skills":
+            try:
+                if not args:
+                    await self._send_command_reply(
+                        msg,
+                        "用法：/skills find <关键词> | /skills add <slug> | /skills list | /skills remove <slug> | /skills update",
+                    )
+                    return True
+
+                skillhub, install_err, auto_installed = await _ensure_skillhub_cli()
+                if not skillhub:
+                    await self._send_command_reply(
+                        msg,
+                        "❌ 自动安装 SkillHub CLI 失败："
+                        f"{install_err or 'unknown error'}\n"
+                        "请手动执行：\n"
+                        "curl -fsSL https://skillhub-1388575217.cos.ap-guangzhou.myqcloud.com/install/install.sh | bash -s -- --cli-only",
+                    )
+                    return True
+
+                sub = args[0].lower()
+                if sub in {"find", "search"}:
+                    subcmd = "search"
+                    passthrough = args[1:]
+                elif sub in {"add", "install"}:
+                    subcmd = "install"
+                    passthrough = args[1:]
+                elif sub in {"list", "ls"}:
+                    subcmd = "list"
+                    passthrough = []
+                elif sub in {"update", "upgrade"}:
+                    subcmd = "upgrade"
+                    passthrough = []
+                elif sub in {"remove", "rm", "uninstall"}:
+                    if len(args) < 2:
+                        await self._send_command_reply(msg, "⚠️ 缺少技能 slug：/skills remove <slug>")
+                        return True
+                    slug = args[1]
+                    skills_dir = self.workspace / "skills"
+                    target = skills_dir / slug
+                    removed = False
+                    try:
+                        if target.exists():
+                            if target.is_dir():
+                                import shutil
+                                shutil.rmtree(target)
+                            else:
+                                target.unlink()
+                            removed = True
+                    except Exception as e:
+                        await self._send_command_reply(msg, f"❌ 删除失败: {e}")
+                        return True
+                    try:
+                        from iflow_bot.utils.helpers import get_iflow_config_dir
+                        iflow_target = get_iflow_config_dir() / "skills" / slug
+                        if iflow_target.exists() and not iflow_target.is_symlink():
+                            if iflow_target.is_dir():
+                                import shutil
+                                shutil.rmtree(iflow_target)
+                            else:
+                                iflow_target.unlink()
+                    except Exception:
+                        pass
+                    await self._send_command_reply(msg, "✅ 已卸载" if removed else "⚠️ 未找到该技能")
+                    return True
+                else:
+                    subcmd = sub
+                    passthrough = args[1:]
+
+                skills_dir = self.workspace / "skills"
+                skills_dir.mkdir(parents=True, exist_ok=True)
+                cmdline = [
+                    skillhub,
+                    "--dir",
+                    str(skills_dir),
+                    "--skip-self-upgrade",
+                    subcmd,
+                ] + passthrough
+                prepared = prepare_subprocess_command(cmdline)
+                proc = await asyncio.create_subprocess_exec(
+                    *prepared,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=str(self.workspace),
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+                code = proc.returncode
+                output = (stdout or b"").decode("utf-8", errors="replace").strip()
+                err = (stderr or b"").decode("utf-8", errors="replace").strip()
+                text = _strip_ansi(output or err or "无输出")
+
+                if subcmd == "search":
+                    text = _format_skillhub_search_output(text)
+                elif subcmd == "list":
+                    text = _format_skillhub_list_output(text)
+                elif subcmd == "install":
+                    slug = passthrough[0] if passthrough else ""
+                    text = _format_skillhub_install_output(text, slug)
+
+                if auto_installed:
+                    text = f"✅ SkillHub CLI 已自动安装\n{text}"
+
+                if len(text) > 4000:
+                    text = text[:4000] + "\n... (truncated)"
+                await self._send_command_reply(msg, text)
+
+                if code == 0 and subcmd in {"install", "upgrade"}:
+                    try:
+                        from iflow_bot.utils.helpers import sync_iflow_skills_dir
+                        sync_iflow_skills_dir(self.workspace)
+                    except Exception:
+                        pass
+            except Exception as e:
+                await self._send_command_reply(msg, f"❌ skills 执行失败: {e}")
+            return True
+
+        if cmd == "/language" and args:
+            lang = args[0]
+            settings_path = self.workspace / ".iflow" / "settings.json"
+            try:
+                if settings_path.exists():
+                    import json
+                    data = json.loads(settings_path.read_text(encoding="utf-8"))
+                else:
+                    data = {}
+                data["language"] = lang
+                settings_path.parent.mkdir(parents=True, exist_ok=True)
+                settings_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+                await self._send_command_reply(msg, f"✅ 已设置 language = {lang}")
+            except Exception as e:
+                await self._send_command_reply(msg, f"❌ 设置语言失败: {e}")
+            return True
+
+        return False
+
     def _get_bootstrap_content(self) -> tuple[Optional[str], bool]:
         """读取引导内容。
         
@@ -156,6 +625,90 @@ time: {now}
         
         return context
 
+    def _append_media_prompt(self, message: str, media: list[str]) -> str:
+        """Append media file hints so the agent can load images/files reliably."""
+        if not media:
+            return message
+
+        lines = [
+            "[用户发送了图片/文件，请读取以下本地路径进行识别，勿编造内容]",
+        ]
+        for item in media:
+            lines.append(f"- {item}")
+        lines.append("如无法读取，请说明原因并提示用户重新发送。")
+
+        prompt = "\n".join(lines)
+        if message:
+            return f"{message}\n\n{prompt}"
+        return prompt
+
+    async def _resolve_media_paths(self, media: list[str]) -> list[str]:
+        """Normalize media to local files (download remote URLs into workspace)."""
+        resolved: list[str] = []
+        if not media:
+            return resolved
+
+        workspace = self.workspace or Path.home() / ".iflow-bot" / "workspace"
+        media_dir = workspace / "images"
+        media_dir.mkdir(parents=True, exist_ok=True)
+
+        def _is_url(value: str) -> bool:
+            return value.startswith("http://") or value.startswith("https://")
+
+        async def _download(url: str) -> Optional[str]:
+            import hashlib
+            import mimetypes
+            import aiohttp
+
+            suffix = ""
+            try:
+                suffix = Path(url.split("?")[0]).suffix
+            except Exception:
+                suffix = ""
+
+            name_hash = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+            file_path = media_dir / f"remote_{name_hash}{suffix or ''}"
+            try:
+                timeout = aiohttp.ClientTimeout(total=30)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(url) as resp:
+                        if resp.status != 200:
+                            logger.warning("Failed to download media: {} -> HTTP {}", url, resp.status)
+                            return None
+                        content_type = resp.headers.get("Content-Type", "")
+                        if not suffix:
+                            ext = mimetypes.guess_extension(content_type.split(";")[0].strip()) or ""
+                            if ext:
+                                file_path = media_dir / f"remote_{name_hash}{ext}"
+                        data = await resp.read()
+                        file_path.write_bytes(data)
+                        return str(file_path)
+            except Exception as e:
+                logger.warning("Failed to download media {}: {}", url, e)
+                return None
+
+        for item in media:
+            if not item:
+                continue
+            if _is_url(item):
+                downloaded = await _download(item)
+                if downloaded:
+                    resolved.append(downloaded)
+                else:
+                    resolved.append(item)
+                continue
+            path = Path(item)
+            if not path.is_absolute():
+                candidate = media_dir / path
+                if candidate.exists():
+                    resolved.append(str(candidate))
+                else:
+                    resolved.append(str(path))
+            else:
+                resolved.append(str(path))
+
+        return resolved
+
     def _analyze_and_build_outbound(
         self,
         response: str,
@@ -207,6 +760,17 @@ time: {now}
             media=media_files,
             metadata=metadata or {},
         )
+
+    def _build_reply_metadata(self, msg: InboundMessage, extra: Optional[dict] = None) -> dict:
+        metadata = dict(extra or {})
+        if msg.metadata:
+            if "is_group" in msg.metadata:
+                metadata["is_group"] = msg.metadata.get("is_group")
+            if "group_id" in msg.metadata:
+                metadata["group_id"] = msg.metadata.get("group_id")
+            if "reply_to_id" not in metadata:
+                metadata["reply_to_id"] = msg.metadata.get("message_id")
+        return metadata
 
     async def run(self) -> None:
         """启动主循环。"""
@@ -272,8 +836,12 @@ time: {now}
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel,
                         chat_id=msg.chat_id,
-                        content="✨ 已开始新对话，之前的上下文已清除。",
+                        content=self._get_new_conversation_message(),
                     ))
+                    return
+
+                # 处理斜杠命令
+                if await self._handle_slash_command(msg):
                     return
 
                 # 准备消息内容
@@ -283,6 +851,11 @@ time: {now}
                 channel_context = self._build_channel_context(msg)
                 if channel_context:
                     message_content = channel_context + "\n\n" + message_content
+
+                # 注入媒体文件路径（用于图片/文件识别）
+                if msg.media:
+                    media_paths = await self._resolve_media_paths(msg.media)
+                    message_content = self._append_media_prompt(message_content, media_paths)
                 
                 # 检查引导文件（优先 BOOTSTRAP.md，否则 AGENTS.md）
                 bootstrap_content, is_bootstrap = self._get_bootstrap_content()
@@ -315,7 +888,7 @@ time: {now}
                         response=response,
                         channel=msg.channel,
                         chat_id=msg.chat_id,
-                        metadata={"reply_to_id": msg.metadata.get("message_id")},
+                        metadata=self._build_reply_metadata(msg),
                     )
                     await self.bus.publish_outbound(outbound)
                     logger.info(f"Response sent to {msg.channel}:{msg.chat_id}")
@@ -411,7 +984,7 @@ time: {now}
                                         channel=channel,
                                         chat_id=chat_id,
                                         content=segment,
-                                        metadata={"reply_to_id": msg.metadata.get("message_id")},
+                                        metadata=self._build_reply_metadata(msg),
                                     ))
                                     from iflow_bot.session.recorder import get_recorder
                                     recorder = get_recorder()
@@ -420,7 +993,7 @@ time: {now}
                                             channel=channel,
                                             chat_id=chat_id,
                                             content=segment,
-                                            metadata={"reply_to_id": msg.metadata.get("message_id")},
+                                            metadata=self._build_reply_metadata(msg),
                                         ))
                 return  # 不走字符缓冲逻辑
 
@@ -443,7 +1016,7 @@ time: {now}
                         metadata={
                             "_progress": True,
                             "_streaming": True,
-                            "reply_to_id": msg.metadata.get("message_id"),
+                            **self._build_reply_metadata(msg),
                         },
                     ))
         
@@ -459,6 +1032,7 @@ time: {now}
             
             # 清理缓冲区并发送最终内容
             final_content = self._stream_buffers.pop(session_key, "")
+            effective_content = (final_content or response or "").strip()
 
             # QQ 渠道：发送遗留的buffer
             if msg.channel == "qq" and qq_channel:
@@ -472,14 +1046,14 @@ time: {now}
                             channel=msg.channel,
                             chat_id=msg.chat_id,
                             content=content_to_send,
-                            metadata={"reply_to_id": msg.metadata.get("message_id")},
+                            metadata=self._build_reply_metadata(msg),
                         ))
                         if recorder:
                             recorder.record_outbound(OutboundMessage(
                                 channel=msg.channel,
                                 chat_id=msg.chat_id,
                                 content=content_to_send,
-                                metadata={"reply_to_id": msg.metadata.get("message_id")},
+                                metadata=self._build_reply_metadata(msg),
                             ))
                 else:
                     remainder_to_send = (qq_segment_buffer + qq_line_buffer).strip()
@@ -488,19 +1062,36 @@ time: {now}
                             channel=msg.channel,
                             chat_id=msg.chat_id,
                             content=remainder_to_send,
-                            metadata={"reply_to_id": msg.metadata.get("message_id")},
+                            metadata=self._build_reply_metadata(msg),
                         ))
                         if recorder:
                             recorder.record_outbound(OutboundMessage(
                                 channel=msg.channel,
                                 chat_id=msg.chat_id,
                                 content=remainder_to_send,
-                                metadata={"reply_to_id": msg.metadata.get("message_id")},
+                                metadata=self._build_reply_metadata(msg),
                             ))
 
-            if final_content:
+            if not effective_content:
+                logger.warning(
+                    f"Streaming produced empty output for {msg.channel}:{msg.chat_id}, retrying non-stream chat"
+                )
+                try:
+                    fallback_response = await self.adapter.chat(
+                        message=message_content,
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        model=self.model,
+                    )
+                    effective_content = (fallback_response or "").strip()
+                except Exception as e:
+                    logger.warning(
+                        f"Non-stream retry failed for {msg.channel}:{msg.chat_id}: {e}"
+                    )
+
+            if effective_content:
                 # 🆕 流式结束后，也用 ResultAnalyzer 分析并附加检测到的文件
-                analysis = result_analyzer.analyze({"output": final_content, "success": True})
+                analysis = result_analyzer.analyze({"output": effective_content, "success": True})
                 media_files = analysis.image_files + analysis.audio_files + analysis.video_files + analysis.doc_files
 
                 if media_files:
@@ -508,7 +1099,7 @@ time: {now}
 
                 # 钉钉：直接调用最终更新
                 if msg.channel == "dingtalk" and dingtalk_channel and hasattr(dingtalk_channel, 'handle_streaming_chunk'):
-                    await dingtalk_channel.handle_streaming_chunk(msg.chat_id, final_content, is_final=True)
+                    await dingtalk_channel.handle_streaming_chunk(msg.chat_id, effective_content, is_final=True)
                     # 钉钉流式结束后，单独发送检测到的文件
                     if media_files:
                         await self.bus.publish_outbound(OutboundMessage(
@@ -522,12 +1113,12 @@ time: {now}
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel,
                         chat_id=msg.chat_id,
-                        content=final_content,
+                        content=effective_content,
                         media=media_files,
                         metadata={
                             "_progress": True,
                             "_streaming": True,
-                            "reply_to_id": msg.metadata.get("message_id"),
+                            **self._build_reply_metadata(msg),
                         },
                     ))
                     # 再发送流式结束标记
@@ -537,9 +1128,26 @@ time: {now}
                         content="",
                         metadata={
                             "_streaming_end": True,
-                            "reply_to_id": msg.metadata.get("message_id"),
+                            **self._build_reply_metadata(msg),
                         },
                     ))
+                elif qq_channel and not final_content:
+                    # QQ：流式无内容时，补发非流式结果
+                    await qq_channel.send(OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content=effective_content,
+                        metadata=self._build_reply_metadata(msg),
+                    ))
+                    from iflow_bot.session.recorder import get_recorder
+                    recorder = get_recorder()
+                    if recorder:
+                        recorder.record_outbound(OutboundMessage(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content=effective_content,
+                            metadata=self._build_reply_metadata(msg),
+                        ))
                 logger.info(f"Streaming response completed for {msg.channel}:{msg.chat_id}")
             else:
                 fallback = (
@@ -550,11 +1158,11 @@ time: {now}
                     channel=msg.channel,
                     chat_id=msg.chat_id,
                     content=fallback,
-                    metadata={"reply_to_id": msg.metadata.get("message_id")},
+                    metadata=self._build_reply_metadata(msg),
                 ))
                 logger.warning(f"Streaming produced empty output for {msg.channel}:{msg.chat_id}")
             
-            return final_content or response
+            return effective_content or response
             
         except Exception as e:
             # 清理缓冲区

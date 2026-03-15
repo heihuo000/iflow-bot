@@ -381,6 +381,13 @@ def init_workspace(workspace: Path) -> None:
             json.dump(default_settings, f, indent=2, ensure_ascii=False)
         console.print(f"[green]{_OK_MARK}[/green] Created {settings_path}")
 
+    # 绑定 iflow skills 目录到 workspace/skills
+    try:
+        from iflow_bot.utils.helpers import ensure_iflow_skills_dir
+        ensure_iflow_skills_dir(workspace)
+    except Exception as e:
+        console.print(f"[yellow]Failed to link iflow skills directory: {e}[/yellow]")
+
     # 检查 workspace 是否已经初始化（通过检查核心文件是否存在）
     core_files = ["AGENTS.md", "BOOT.md", "SOUL.md"]
     is_initialized = any((workspace / f).exists() for f in core_files)
@@ -563,8 +570,19 @@ def start_mcp_proxy(port: int = 8888) -> bool:
     try:
         config_file = _resolve_mcp_proxy_config_file()
         if not config_file:
-            console.print("[yellow]MCP 代理配置文件不存在: ~/.iflow-bot/config/.mcp_proxy_config.json[/yellow]")
-            return False
+            try:
+                from iflow_bot.utils.helpers import sync_mcp_from_iflow
+                if sync_mcp_from_iflow(overwrite=False):
+                    config_file = _resolve_mcp_proxy_config_file()
+            except Exception:
+                config_file = None
+
+        if not config_file:
+            runtime_config = get_config_dir() / "config" / ".mcp_proxy_config.json"
+            runtime_config.parent.mkdir(parents=True, exist_ok=True)
+            if not runtime_config.exists():
+                runtime_config.write_text('{"mcpServers": {}}', encoding="utf-8")
+            config_file = runtime_config
 
         pid_file = get_mcp_proxy_pid_file()
         log_file = get_mcp_proxy_log_file()
@@ -701,11 +719,26 @@ def gateway_run(
     """前台运行 Gateway 服务（debug 模式）。"""
     print_banner()
 
+    config = load_config()
+
+    # 检查并启动 MCP 代理（与 gateway start 保持一致）
+    should_start_mcp = config.driver.mcp_proxy_auto_start if hasattr(config, "driver") and config.driver else True
+    if should_start_mcp and config.driver.mcp_proxy_enabled:
+        mcp_port = config.driver.mcp_proxy_port
+        if not check_mcp_proxy_running(mcp_port):
+            console.print(f"[cyan]正在启动 MCP 代理 (端口: {mcp_port})...[/cyan]")
+            if start_mcp_proxy(mcp_port):
+                console.print(f"[green]{_OK_MARK}[/green] MCP 代理已启动")
+            else:
+                console.print(f"[yellow]MCP 代理启动失败，将继续运行网关[/yellow]")
+        else:
+            console.print(f"[green]{_OK_MARK}[/green] MCP 代理已在运行 (端口: {mcp_port})")
+        console.print()
+
     # 检查 iflow 是否就绪
     if not ensure_iflow_ready():
         raise typer.Exit(1)
 
-    config = load_config()
     workspace = Path(config.get_workspace())
 
     # 初始化 workspace
@@ -922,6 +955,15 @@ async def _run_gateway(config, verbose: bool = False) -> None:
             else None
         ),
     )
+
+    # STDIO 模式：启动时预热 ACP（start + initialize + authenticate）
+    if mode == "stdio":
+        console.print("[cyan]预热 Stdio ACP (initialize + authenticate)...[/cyan]")
+        try:
+            await adapter._get_stdio_adapter()
+            console.print(f"[green]{_OK_MARK}[/green] Stdio ACP 预热完成")
+        except Exception as e:
+            console.print(f"[yellow]Stdio ACP 预热失败，将在首条消息时重试: {e}[/yellow]")
     
     bus = MessageBus()
     channel_manager = ChannelManager(config, bus)
@@ -935,7 +977,8 @@ async def _run_gateway(config, verbose: bool = False) -> None:
     
     # 创建 Cron 服务
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
-    cron = CronService(cron_store_path)
+    driver_timeout = getattr(config.driver, "timeout", 600) if config and config.driver else 600
+    cron = CronService(cron_store_path, job_timeout_s=driver_timeout)
     
     # 设置 cron 任务回调
     async def on_cron_job(job: CronJob) -> str | None:
@@ -1311,7 +1354,8 @@ app.command(name="config")(config_cmd)
 
 def _run_iflow_cmd(cmd: list[str], cwd: Optional[Path] = None) -> int:
     """执行 iflow 命令（跨平台）。"""
-    kwargs = {"cwd": str(cwd) if cwd else None}
+    resolved_cwd = cwd.expanduser() if cwd else None
+    kwargs = {"cwd": str(resolved_cwd) if resolved_cwd else None}
     result = run_command(cmd, **kwargs)
     return result.returncode
 
